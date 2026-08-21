@@ -1,0 +1,45 @@
+# Ready-to-run CsPbI3 NVT example for the exported MAMBA-ACE model.
+# Command-line -var values override these defaults.
+variable data index cspbi3.data
+variable model index mtace_cspbi3_lammps.pt
+variable temperature index 300.0
+variable steps index 10000
+variable seed index 20260714
+
+units metal
+atom_style atomic
+boundary p p p
+newton on
+
+read_data ${data}
+
+# cspbi3.data uses the explicit type order 1=Cs, 2=Pb, 3=I.
+mass 1 132.90545196
+mass 2 207.2
+mass 3 126.90447
+
+neighbor 1.0 bin
+neigh_modify every 1 delay 0 check yes
+
+pair_style mamba device auto check_finite yes
+pair_coeff * * ${model} Cs Pb I
+
+compute atomic_energy all pe/atom
+thermo 100
+thermo_style custom step atoms temp pe ke etotal press pxx pyy pzz pxy pxz pyz vol
+thermo_modify flush yes
+
+# Verify model loading, element mapping, energy, forces, and virial before MD.
+run 0
+
+reset_timestep 0
+timestep 0.001
+velocity all create ${temperature} ${seed} mom yes rot yes dist gaussian
+fix ensemble all nvt temp ${temperature} ${temperature} 0.1
+
+dump trajectory all custom 1000 cspbi3.lammpstrj id type element x y z fx fy fz c_atomic_energy
+dump_modify trajectory element Cs Pb I sort id
+
+run ${steps}
+
+write_restart cspbi3.restart

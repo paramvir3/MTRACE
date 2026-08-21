@@ -1,0 +1,114 @@
+# CsPbI3 architecture-v7 shell-coupling ablation under the v8 code.
+# Run from this directory with:
+# python ../../train.py --config config_shell_legacy.yaml
+
+# Data and leakage-aware trajectory split. train.extxyz is the 979-frame
+# comparison subset used by the prior TRACE-v2 run. For a final full-data fit,
+# replace it with ./training_cspbi3.extxyz.
+train_file: ./train.extxyz
+valid_file: null
+validation_fraction: 0.10
+split_mode: blocked
+split_block_size: 25
+split_gap: 2
+seed: 42
+
+# A new filename deliberately avoids overwriting the legacy TRACE checkpoints.
+model_save_path: ./mtace_cspbi3_shell_legacy.pt
+save_last_checkpoint: true
+last_model_save_path: ./mtace_cspbi3_shell_legacy_last.pt
+# Use at most one. Exact resume restores all training state; warm restart keeps
+# the checkpoint model/species/reference contract but resets optimization.
+resume_from: null
+restart_from: null
+
+# Exact TRACE-v2 ACE frontend. The separate mixer branch uses localized physical
+# radial shells, so it does not scan the conventional ordering of Bessel modes.
+architecture: mtace_v2
+r_max: 6.0
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 1
+correlation_order: 4
+correlation_channels: 16
+radial_basis_type: bessel
+radial_trainable: false
+gaussian_width: 0.5
+radial_mlp_hidden: 32
+radial_mlp_layers: 2
+tokenizer_type: physical_shells
+num_shells: 32
+shell_coupling_mode: legacy
+mixer_type: mamba
+attention_heads: 4
+
+# Bidirectional physical-radius state-space mixer. The portable backend is
+# required for force/stress training because it preserves higher-order autograd.
+mamba_variant: mamba3
+mamba_dim: 64
+mamba_d_state: 16
+mamba_expand: 2
+mamba_headdim: 16
+mamba_bidirectional_tied: false
+mamba_rope_fraction: 0.5
+mamba_a_floor: 0.0001
+mamba_mimo_rank: 4
+mamba_chunk_size: 16
+mamba_angle_mode: official
+mamba_backend: torch
+ffn_hidden: 128
+dropout: 0.03
+# Mixer-specific attention-weight dropout is zero in controlled comparisons.
+attention_dropout: 0.0
+layer_scale_init: 0.01
+readout_hidden: 64
+
+# Training. Use device: cpu for a portable smoke run; use device: cuda on an
+# NVIDIA training node. MTACE currently trains in full precision.
+epochs: 200
+batch_size: 8
+device: cpu
+dtype: float32
+allow_tf32: false
+deterministic_algorithms: false
+precompute_neighbors: true
+num_workers: 0
+report_stress_metrics: true
+clip_grad_norm: 10.0
+early_stopping_patience: 20
+
+# Cosine schedule and the audited Muon + auxiliary AdamW partition.
+optimizer: muon
+learning_rate: 0.001
+minimum_learning_rate: 0.00001
+weight_decay: 0.00001
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_nesterov: true
+muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
+muon_eps: 0.0000001
+muon_ns_precision: auto
+muon_adjust_lr_fn: match_rms_adamw
+muon_parameter_mode: hidden
+muon_include: []
+muon_exclude: []
+muon_aux_betas: [0.9, 0.95]
+muon_aux_eps: 0.0000000001
+
+# All available structures have the same Cs8Pb8I24 composition, so three
+# independent elemental reference energies cannot be identified. A common
+# per-atom reference equal to the training-split mean centers the regression
+# without inventing composition-dependent chemical potentials.
+solve_atomic_energies: false
+atomic_energies:
+  Cs: -31.8566442204058
+  Pb: -31.8566442204058
+  I: -31.8566442204058
+
+# Loss units are (eV/atom)^2, (eV/Angstrom)^2, and (eV/Angstrom^3)^2.
+# The stress term uses a norm-preserving Mandel vector, so shear errors carry
+# the correct factor of two from the symmetric tensor Frobenius norm.
+energy_weight: 1.0
+forces_weight: 10.0
+stress_weight: 1000.0

@@ -1,0 +1,72 @@
+train_file: ./train.extxyz
+valid_file: null
+validation_fraction: 0.10
+split_mode: blocked
+split_block_size: 25
+split_gap: 2
+seed: 42
+
+model_save_path: ./mtace_water.pt
+save_last_checkpoint: true
+last_model_save_path: ./mtace_water_last.pt
+
+architecture: mtace_v2
+r_max: 6.0
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 2
+correlation_order: 4
+correlation_channels: 16
+radial_basis_type: bessel
+radial_trainable: false
+radial_mlp_hidden: 32
+radial_mlp_layers: 2
+tokenizer_type: physical_shells
+num_shells: 32
+shell_coupling_mode: conservative
+mixer_type: mamba
+mamba_variant: mamba3
+mamba_dim: 64
+mamba_d_state: 16
+mamba_expand: 2
+mamba_headdim: 16
+mamba_bidirectional_tied: false
+mamba_rope_fraction: 0.5
+mamba_a_floor: 0.0001
+mamba_mimo_rank: 4
+mamba_chunk_size: 32
+mamba_angle_mode: official
+mamba_backend: torch
+ffn_hidden: 128
+dropout: 0.01
+attention_dropout: 0.0
+layer_scale_init: 0.01
+
+epochs: 100
+batch_size: 4
+device: cpu
+dtype: float32
+precompute_neighbors: true
+num_workers: 0
+report_stress_metrics: false
+optimizer: muon
+learning_rate: 0.001
+minimum_learning_rate: 0.00001
+weight_decay: 0.00001
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_nesterov: true
+muon_ns_precision: auto
+muon_adjust_lr_fn: match_rms_adamw
+muon_parameter_mode: hidden
+muon_aux_betas: [0.9, 0.95]
+muon_aux_eps: 0.0000000001
+clip_grad_norm: 10.0
+early_stopping_patience: 20
+
+solve_atomic_energies: false
+atomic_energies: {H: 0.0, O: 0.0}
+energy_weight: 1.0
+forces_weight: 1.0
+stress_weight: 0.0

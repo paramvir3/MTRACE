@@ -1,0 +1,108 @@
+{
+  "density_normalization": {
+    "protocol": "How much does the node feature move when coordination changes?\n\n    Protocol, stated because the number depends on it: fcc copper conventional\n    cells repeated 2x2x2, lattice constants 4.2 / 3.6 / 3.1 / 2.8 Angstrom,\n    r_max = 6 A, l_max = 2, correlation_order = 4, seed 0, float64, untrained\n    weights.  The reported figure is\n    ``max(rms node feature) / min(rms node feature)`` over the sweep.",
+    "lattice_constants_angstrom": [
+      4.2,
+      3.6,
+      3.1,
+      2.8
+    ],
+    "avg_num_neighbors": 110.5,
+    "normalization_off": {
+      "node_feature_rms": [
+        0.3763429313804287,
+        0.41608468173238233,
+        0.6985221396451861,
+        1.63484232004156
+      ],
+      "spread": 4.344022920916692
+    },
+    "normalization_on": {
+      "node_feature_rms": [
+        0.2888064111626805,
+        0.2875635535678716,
+        0.288196670833397,
+        0.29274203016915307
+      ],
+      "spread": 1.018008111727063
+    },
+    "neighbours_per_atom": [
+      54.0,
+      78.0,
+      134.0,
+      176.0
+    ],
+    "coordination_sweep": 3.259259259259259
+  },
+  "derivative_contract": [
+    {
+      "num_shells": 16,
+      "span_angstrom": 4.0,
+      "measured_jump": 316.40625000713123,
+      "predicted_jump": 316.40625
+    },
+    {
+      "num_shells": 32,
+      "span_angstrom": 4.0,
+      "measured_jump": 2792.9062501075987,
+      "predicted_jump": 2792.90625
+    },
+    {
+      "num_shells": 32,
+      "span_angstrom": 6.0,
+      "measured_jump": 827.5277777898141,
+      "predicted_jump": 827.527777777778
+    },
+    {
+      "num_shells": 24,
+      "span_angstrom": 4.5,
+      "measured_jump": 801.1193415914474,
+      "predicted_jump": 801.1193415637858
+    }
+  ],
+  "shell_occupancy": {
+    "shortest_distance_angstrom": 2.932716323976613,
+    "cases": [
+      {
+        "num_shells": 32,
+        "shell_r_min": 0.0,
+        "dead_shells": 14,
+        "dead_fraction": 0.4375
+      },
+      {
+        "num_shells": 32,
+        "shell_r_min": 2.0,
+        "dead_shells": 6,
+        "dead_fraction": 0.1875
+      },
+      {
+        "num_shells": 16,
+        "shell_r_min": 2.0,
+        "dead_shells": 2,
+        "dead_fraction": 0.125
+      }
+    ]
+  },
+  "invariant_homogeneity": {
+    "squared": {
+      "2.0": {
+        "scalar_block": 2.0,
+        "norm_block": 4.0
+      },
+      "4.0": {
+        "scalar_block": 4.0,
+        "norm_block": 16.0
+      }
+    },
+    "homogeneous": {
+      "2.0": {
+        "scalar_block": 2.0,
+        "norm_block": 2.000004794723314
+      },
+      "4.0": {
+        "scalar_block": 4.0,
+        "norm_block": 4.000014384181243
+      }
+    }
+  }
+}

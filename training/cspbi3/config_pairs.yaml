@@ -1,0 +1,134 @@
+# Architecture-v10 expressivity variant of config.yaml for CsPbI3.
+#
+#     python ../../train.py --config config_pairs.yaml
+#
+# Identical to config.yaml except for the four settings below, so the pair is a
+# controlled comparison of the architecture-v10 expressivity terms:
+#
+#   shell_pair_channels / shell_pair_width
+#       Banded equivariant product between shells k and k+d.  A strict sub-sum of
+#       TP(A_i, A_i) = sum_{k,k'} TP(T_ik, T_ik'), so it carries information the
+#       direct ACE path does not have whenever L exceeds the ACE radial channel
+#       count (here 16 shells against 12 radial channels).  Physically it is
+#       angular correlation resolved between two radii, i.e. bond-angle
+#       information at a specified pair of distances -- which is exactly what
+#       octahedral tilting in a perovskite is.
+#
+#   coupling_mode: path_weights
+#       The mixer emits the weights of the equivariant map instead of one scalar
+#       gate per irrep copy, so it can change how channels within an l combine.
+#       The gate is a strict special case.  Note the update starts 1.50x the
+#       gate-mode update at identical seed; layer_scale absorbs it.
+#
+#   invariant_pair_channels
+#       Adds learned cross-channel overlaps to the invariant map, which per-copy
+#       norms alone discard.
+#
+# Watch `gate_shell_dependence` in the log.  residual_fraction is the share of
+# the equivariant update a shell-constant gate cannot reproduce; because
+# sum_k T_ik = A_i, a value near zero means the mixer has collapsed onto plain
+# ACE regardless of what the error columns say.  It should GROW during training.
+train_file: ../../examples/cspbi3/train.extxyz
+valid_file: null
+validation_fraction: 0.1
+split_mode: blocked
+split_block_size: 25
+split_gap: 2
+seed: 42
+model_save_path: ./model_pairs.pt
+save_last_checkpoint: true
+last_model_save_path: ./model_pairs_last.pt
+resume_from: null
+restart_from: null
+architecture: mtace_v2
+r_max: 6.0
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 1
+correlation_order: 4
+correlation_channels: 16
+radial_basis_type: bessel
+radial_trainable: false
+radial_mlp_hidden: 32
+radial_mlp_layers: 2
+tokenizer_type: physical_shells
+num_shells: 16
+shell_coupling_mode: conservative
+shell_boundary_mode: fold
+shell_degree: 5
+shell_r_min: 2.0
+shell_r_min_margin: 0.25
+avg_num_neighbors: auto
+mixer_type: mamba
+mamba_variant: mamba3
+mamba_dim: 64
+mamba_d_state: 16
+mamba_expand: 2
+mamba_headdim: 16
+mamba_mimo_rank: 4
+mamba_chunk_size: 16
+mamba_rope_fraction: 0.5
+mamba_a_floor: 0.0001
+mamba_angle_mode: official
+mamba_rotary_layout: halves
+mamba_scan_mode: auto
+mamba_bidirectional_tied: false
+mamba_backend: torch
+invariant_norm: homogeneous
+invariant_norm_eps: 0.0001
+invariant_pair_channels: 4
+shell_pair_channels: 8
+shell_pair_width: 2
+coupling_mode: path_weights
+ffn_hidden: 128
+ffn_type: swiglu
+readout_hidden: 64
+layer_scale_init: 0.01
+dropout: 0.03
+attention_dropout: 0.0
+epochs: 100
+batch_size: 8
+device: cpu
+dtype: float32
+precompute_neighbors: true
+num_workers: 0
+torch_num_threads: 10
+allow_tf32: false
+deterministic_algorithms: false
+clip_grad_norm: 1.0
+early_stopping_patience: 20
+report_stress_metrics: true
+gate_diagnostic_every: 5
+optimizer: muon
+learning_rate: 0.001
+minimum_learning_rate: 5.0e-05
+weight_decay: 1.0e-05
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_nesterov: true
+muon_ns_coefficients:
+- 3.4445
+- -4.775
+- 2.0315
+muon_eps: 1.0e-07
+muon_ns_precision: auto
+muon_adjust_lr_fn: match_rms_adamw
+muon_parameter_mode: equivariant
+muon_include: []
+muon_exclude: []
+muon_aux_betas:
+- 0.9
+- 0.95
+muon_aux_eps: 1.0e-10
+ema_decay: 0.999
+solve_atomic_energies: false
+atomic_energies:
+  Cs: -31.8596670627702
+  Pb: -31.8596670627702
+  I: -31.8596670627702
+normalize_loss_weights: true
+energy_weight: 1.0
+forces_weight: 5.0
+stress_weight: 1.0
+coupling_channels: 8

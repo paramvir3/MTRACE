@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtace"
+version = "0.8.0"
+description = "Permutation-invariant selective state-space potentials built on Atomic Cluster Expansion"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "MTACE contributors"}]
+dependencies = [
+  "torch>=2.2",
+  "e3nn>=0.4.4,<0.7",
+  "ase>=3.22",
+  "numpy>=1.23",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+mtace-export-lammps = "mtace.deployment:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+plot = ["matplotlib>=3.6"]
+cuda = ["mamba-ssm>=2.3.2"]
+
+[tool.setuptools.packages.find]
+include = ["mtace*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+  "ignore:The TorchScript type system doesn't support instance-level annotations.*:UserWarning",
+]

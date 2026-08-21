@@ -1,0 +1,21 @@
+units metal
+atom_style atomic
+boundary p p p
+
+region simulation_box block 0 8 0 8 0 8 units box
+create_box 2 simulation_box
+create_atoms 1 single 3.00 4.00 4.00 units box
+create_atoms 2 single 3.95 4.00 4.00 units box
+create_atoms 1 single 2.80 4.92 4.00 units box
+mass 1 1.008
+mass 2 15.999
+
+newton on
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+pair_style mamba device auto
+pair_coeff * * model.mtace.pt H O
+
+thermo 1
+thermo_style custom step atoms pe press pxx pyy pzz pxy pxz pyz
+run 0

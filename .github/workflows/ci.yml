@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[test]"
+      - name: Show environment
+        run: python -c "import torch, e3nn, ase, numpy; print(torch.__version__, e3nn.__version__, ase.__version__, numpy.__version__)"
+      - name: Run the test suite
+        # -W error on our own deprecations keeps the suite honest; the optional
+        # Muon and LAMMPS cases skip cleanly when their dependencies are absent.
+        run: python -m pytest tests -q --durations=10
+      - name: Verify the equation-to-code checks
+        run: python -m pytest tests/test_architecture_v9.py tests/test_symmetry.py -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile every module
+        run: python -m compileall -q mtace train.py benchmarks experiments tests

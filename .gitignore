@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+*.pt
+*.pth
+*.extxyz
+*.xyz
+*.dump
+*.lammpstrj
+*.restart
+log.lammps
+build/
+dist/
+*.aux
+*.log
+*.out
+output/pdf/*
+!output/pdf/*.pdf
+.DS_Store
+
+# LaTeX build artifacts (the compiled PDF is committed, the intermediates are not)
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*Notes.bib
+
+# Kept local only, by request: maintained by hand and not published.
+# Leading slash restricts these to the repository root, so the tracked
+# examples/*/README.md and lammps/README.md are unaffected.
+/README.md
+/docs/
