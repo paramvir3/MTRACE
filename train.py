@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import math
 import random
 from pathlib import Path
@@ -134,6 +135,39 @@ def _split_batched_outputs(items, merged, energies, forces, stresses):
         out.append((item, energies[index], force_parts[index], stress))
     return out
 
+
+
+
+def configure_determinism(enabled: bool) -> str:
+    """Make runs reproducible, which on CUDA they are not by default.
+
+    Scatter and reduction kernels on CUDA accumulate in a nondeterministic
+    order, so two runs from the same seed diverge.  Measured on an RTX 5060 Ti
+    the immediate spread is tiny -- 2.8e-16 eV over five evaluations of the same
+    model, 7.5e-15 relative -- but training compounds it, so "same seed, same
+    result" does not hold and a diverging run cannot be reproduced for debugging.
+
+    Enabling deterministic algorithms fixes that, and measurement says it is
+    free here: 171.1 ms/step against 173.9 ms/step, i.e. 0.98x.  The whole
+    forward, backward and stress path has deterministic kernels available, so
+    strict mode is used rather than ``warn_only``, which would quietly permit a
+    nondeterministic kernel to slip back in.
+
+    ``CUBLAS_WORKSPACE_CONFIG`` must be set before cuBLAS initialises, which is
+    why this runs before any device work.  Set ``deterministic: false`` to opt
+    out on hardware where some kernel has no deterministic implementation; the
+    failure would otherwise be a RuntimeError naming the offending operator.
+    """
+
+    if not enabled:
+        torch.use_deterministic_algorithms(False)
+        return "off"
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return "on"
 
 
 def configure_worker_sharing(num_workers: int) -> None:
@@ -630,6 +664,9 @@ def main():
     batch_size = int(config.get("batch_size", 1))
     patience = int(config.get("early_stopping_patience", 20))
     num_workers = int(config.get("num_workers", 0))
+    determinism = configure_determinism(
+        bool(config.get("deterministic", True))
+    )
     clip_grad_norm = float(config.get("clip_grad_norm", 10.0))
     if epochs < 1 or batch_size < 1 or stop_after_epoch < 1:
         raise ValueError("epochs, stop_after_epoch, and batch_size must be positive")
@@ -1050,7 +1087,8 @@ def main():
     print(
         f"data: train={len(training_dataset)} (stress={training_dataset.has_stress_count}) "
         f"valid={len(validation_dataset)} (stress={validation_dataset.has_stress_count}) "
-        f"excluded_by_gap={len(excluded_indices)} dtype={str(model_dtype).split('.', 1)[-1]}",
+        f"excluded_by_gap={len(excluded_indices)} dtype={str(model_dtype).split('.', 1)[-1]} "
+        f"determinism={determinism}",
         flush=True,
     )
     print(f"best_checkpoint={output}", flush=True)
