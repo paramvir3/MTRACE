@@ -63,6 +63,7 @@ MODEL_KEYS = {
     "decay_mode", "screening_min_angstrom",
     "shell_pair_state_clip",
     "coupling_mode", "coupling_channels",
+    "gate_norm",
     "mixer_schedule",
     "num_experts", "expert_hidden", "expert_latent_dim",
     "router_tau", "router_switch", "router_threshold_init",
@@ -751,6 +752,7 @@ def main():
             "shell_coupling_mode",
             # CanonicalMambaACE has no schedule and no routed experts.
             "mixer_schedule",
+            "gate_norm",
             "num_experts",
             "expert_hidden",
             "expert_latent_dim",

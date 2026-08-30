@@ -506,6 +506,7 @@ class EquivariantMambaACEBlock(nn.Module):
         shell_spacing_angstrom: float = 1.0,
         coupling_mode: str = "gate",
         coupling_channels: int = 8,
+        gate_norm: str = "none",
         num_experts: int = 0,
         expert_hidden: int | None = None,
         expert_latent_dim: int | None = None,
@@ -749,6 +750,33 @@ class EquivariantMambaACEBlock(nn.Module):
             else None
         )
 
+        # ---- normalisation before the gate ---------------------------------
+        # The gate is the one consumer of the mixer state that feeds a
+        # *saturating* nonlinearity, and it was the one place without a norm in
+        # front of it; the scalar residual block normalises through
+        # ``scalar_norm``.  Measured consequence on a converged CsPbI3 run: the
+        # Mamba state grew from ||m|| = 1.14 at initialisation to 6529 after 100
+        # epochs while its input stayed at ~1.0, so every pre-activation reached
+        # |W_g m + b| ~ 4768 and tanh saturated to +-1 everywhere.  The shell
+        # variation was still present in the state (spread 748) and was
+        # destroyed by the saturation, collapsing the residual-fraction
+        # diagnostic to exactly zero -- the model degenerating to plain ACE
+        # while its error metrics kept improving.
+        #
+        # ``gate_norm`` puts the state on a fixed scale first, so the gate
+        # cannot be driven into saturation by the mixer's output magnitude.
+        # Default 'none' reproduces the previous architecture exactly and adds
+        # no parameters.
+        gate_norm = str(gate_norm).lower()
+        if gate_norm not in {"none", "rms", "layer"}:
+            raise ValueError("gate_norm must be 'none', 'rms', or 'layer'")
+        self.gate_norm_mode = gate_norm
+        if gate_norm == "rms":
+            self.gate_norm = RMSNorm(mamba_dim)
+        elif gate_norm == "layer":
+            self.gate_norm = nn.LayerNorm(mamba_dim)
+        else:
+            self.gate_norm = None
         self.gate_projection = nn.Linear(mamba_dim, self.num_node_copies)
         self.value_projection = o3.Linear(self.token_irreps, self.node_irreps)
         self.output_projection = o3.Linear(self.node_irreps, self.node_irreps)
@@ -1125,6 +1153,11 @@ class EquivariantMambaACEBlock(nn.Module):
             )
         return self.mixer(controls, require_higher_order=require_higher_order)
 
+    def _gate_input(self, states: torch.Tensor) -> torch.Tensor:
+        """States as the gate sees them; identity unless ``gate_norm`` is set."""
+
+        return states if self.gate_norm is None else self.gate_norm(states)
+
     def _shell_dynamics(self, states: torch.Tensor):
         """Invariant decay and drive coefficients for the shell recurrences."""
 
@@ -1307,7 +1340,7 @@ class EquivariantMambaACEBlock(nn.Module):
             )
             probe = emitted
         else:
-            gates = torch.tanh(self.gate_projection(states))
+            gates = torch.tanh(self.gate_projection(self._gate_input(states)))
             expanded = _expand_irrep_scalars(gates, self.node_blocks)
             values = self._token_values(tokens)
             full = self._reduce_token_updates(expanded * values)
@@ -1343,7 +1376,7 @@ class EquivariantMambaACEBlock(nn.Module):
         if self.coupling_mode == "path_weights":
             update = self._path_weight_update(tokens, states)
         else:
-            gates = torch.tanh(self.gate_projection(states))
+            gates = torch.tanh(self.gate_projection(self._gate_input(states)))
             gates = _expand_irrep_scalars(gates, self.node_blocks)
             values = self._token_values(tokens)
             update = self._reduce_token_updates(gates * values)
