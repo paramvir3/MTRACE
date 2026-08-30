@@ -28,6 +28,24 @@ def _positive_integer(name: str, value) -> int:
     return int(parsed)
 
 
+def _voigt_basis(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """The six symmetric strain generators, in the order the scalar path uses.
+
+    ``basis[k]`` is the matrix that Voigt component ``k`` multiplies, so
+    ``epsilon = einsum("bk,kij->bij", strain, basis)`` reproduces the explicit
+    assignment in the single-structure branch of :meth:`forward` exactly:
+    the three normal components on the diagonal, and each shear component
+    written into both symmetric off-diagonal entries.
+    """
+
+    basis = torch.zeros((6, 3, 3), dtype=dtype, device=device)
+    basis[0, 0, 0] = basis[1, 1, 1] = basis[2, 2, 2] = 1.0
+    basis[3, 0, 1] = basis[3, 1, 0] = 1.0
+    basis[4, 0, 2] = basis[4, 2, 0] = 1.0
+    basis[5, 1, 2] = basis[5, 2, 1] = 1.0
+    return basis
+
+
 def _mamba_rank_and_chunk(mimo_rank: int, chunk_size: int | None) -> tuple[int, int]:
     rank = _positive_integer("mamba_mimo_rank", mimo_rank)
     if chunk_size is None:
@@ -156,13 +174,25 @@ class CanonicalMambaACE(nn.Module):
         edge_index: torch.Tensor,
         edge_shift: torch.Tensor,
         require_higher_order: bool = False,
+        batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if z.ndim != 1 or z.dtype != torch.long:
             raise ValueError("z must be a one-dimensional torch.long tensor")
         if pos.ndim != 2 or pos.shape != (z.numel(), 3) or not pos.is_floating_point():
             raise ValueError("pos must be a floating tensor with shape (num_atoms, 3)")
-        if cell.shape != (3, 3) or not cell.is_floating_point():
-            raise ValueError("cell must be a floating tensor with shape (3, 3)")
+        if batch is None:
+            if cell.shape != (3, 3) or not cell.is_floating_point():
+                raise ValueError("cell must be a floating tensor with shape (3, 3)")
+        else:
+            # Batched: several structures concatenated into one disconnected
+            # graph.  Nothing in this function mixes atoms except through
+            # ``edge_index``, so as long as no edge crosses structures the
+            # per-atom energies are identical to evaluating each structure on
+            # its own.  ``tests/test_batching.py`` asserts that in FP64.
+            if batch.dtype != torch.long or batch.shape != (z.numel(),):
+                raise ValueError("batch must be torch.long with shape (num_atoms,)")
+            if cell.ndim != 3 or cell.shape[1:] != (3, 3) or not cell.is_floating_point():
+                raise ValueError("batched cell must be floating with shape (num_graphs, 3, 3)")
         if edge_index.ndim != 2 or edge_index.shape[0] != 2 or edge_index.dtype != torch.long:
             raise ValueError("edge_index must be torch.long with shape (2, num_edges)")
         if edge_shift.shape != (edge_index.shape[1], 3) or not edge_shift.is_floating_point():
@@ -179,7 +209,16 @@ class CanonicalMambaACE(nn.Module):
             raise ValueError("edge_index contains an atom index outside the structure")
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
         if edge_shift.numel() > 0:
-            edge_vec = edge_vec + edge_shift.to(dtype=pos.dtype, device=pos.device) @ cell
+            shift = edge_shift.to(dtype=pos.dtype, device=pos.device)
+            if batch is None:
+                edge_vec = edge_vec + shift @ cell
+            else:
+                # Each edge takes the cell of the structure it belongs to.  An
+                # edge never crosses structures, so the sender's assignment is
+                # well defined and equals the receiver's.
+                edge_vec = edge_vec + torch.einsum(
+                    "ei,eij->ej", shift, cell.index_select(0, batch[edge_index[0]])
+                )
         edge_len = torch.linalg.vector_norm(edge_vec, dim=-1)
         if not bool(torch.isfinite(edge_len).all()):
             raise ValueError("edge geometry produced a nonfinite distance")
@@ -213,6 +252,12 @@ class CanonicalMambaACE(nn.Module):
             "edge_shift", pos.new_zeros((edge_index.shape[1], 3))
         )
         volume = data.get("volume")
+        # ``batch`` maps each atom to its structure.  Absent means a single
+        # structure, and that path is left byte-for-byte as it was.
+        batch = data.get("batch")
+        if batch is not None:
+            batch = batch.to(device=pos.device)
+            num_graphs = int(batch.max()) + 1 if batch.numel() else 0
         if compute_stress is None:
             compute_stress = bool(training and volume is not None)
         if detach_pos:
@@ -220,7 +265,7 @@ class CanonicalMambaACE(nn.Module):
         pos = pos.requires_grad_(True)
         cell = cell.to(device=pos.device, dtype=pos.dtype)
 
-        if compute_stress:
+        if compute_stress and batch is None:
             reference_volume = torch.det(cell).abs()
             if not bool(torch.isfinite(reference_volume)) or bool(reference_volume <= 1.0e-12):
                 raise ValueError("stress requires a finite full-rank cell")
@@ -233,6 +278,23 @@ class CanonicalMambaACE(nn.Module):
             deformation = torch.eye(3, device=pos.device, dtype=pos.dtype) + epsilon
             deformed_pos = pos @ deformation
             deformed_cell = cell @ deformation
+        elif compute_stress:
+            reference_volume = torch.det(cell).abs()
+            if not bool(torch.isfinite(reference_volume).all()) or bool(
+                (reference_volume <= 1.0e-12).any()
+            ):
+                raise ValueError("stress requires a finite full-rank cell")
+            strain = torch.zeros(
+                (num_graphs, 6), device=pos.device, dtype=pos.dtype, requires_grad=True
+            )
+            basis = _voigt_basis(pos.dtype, pos.device)
+            epsilon = torch.einsum("bk,kij->bij", strain, basis)
+            deformation = torch.eye(3, device=pos.device, dtype=pos.dtype) + epsilon
+            # ``pos @ deformation`` per structure, applied per atom.
+            deformed_pos = torch.einsum(
+                "ni,nij->nj", pos, deformation.index_select(0, batch)
+            )
+            deformed_cell = torch.bmm(cell, deformation)
         else:
             strain = None
             deformed_pos, deformed_cell = pos, cell
@@ -244,10 +306,21 @@ class CanonicalMambaACE(nn.Module):
             edge_index,
             edge_shift,
             require_higher_order=training,
+            batch=batch,
         )
-        energy = atomic_energy.sum()
+        if batch is None:
+            energy = atomic_energy.sum()
+            total_energy = energy
+        else:
+            # Per-structure energy by segment sum; the scalar the gradients are
+            # taken against is their total, which is what makes one backward
+            # pass equivalent to summing per-structure backward passes.
+            energy = atomic_energy.new_zeros(num_graphs).index_add(
+                0, batch, atomic_energy
+            )
+            total_energy = energy.sum()
         position_gradient = torch.autograd.grad(
-            energy,
+            total_energy,
             pos,
             create_graph=training,
             retain_graph=training or compute_stress,
@@ -255,21 +328,33 @@ class CanonicalMambaACE(nn.Module):
         )[0]
         forces = -position_gradient if position_gradient is not None else torch.zeros_like(pos)
 
-        stress = pos.new_zeros((3, 3))
+        stress = (
+            pos.new_zeros((3, 3)) if batch is None
+            else pos.new_zeros((num_graphs, 3, 3))
+        )
         if compute_stress and strain is not None:
             strain_gradient = torch.autograd.grad(
-                energy,
+                total_energy,
                 strain,
                 create_graph=training,
                 retain_graph=training,
                 allow_unused=True,
             )[0]
-            if strain_gradient is not None:
+            if strain_gradient is not None and batch is None:
                 stress[0, 0], stress[1, 1], stress[2, 2] = strain_gradient[:3]
                 stress[0, 1] = stress[1, 0] = 0.5 * strain_gradient[3]
                 stress[0, 2] = stress[2, 0] = 0.5 * strain_gradient[4]
                 stress[1, 2] = stress[2, 1] = 0.5 * strain_gradient[5]
                 stress = stress / reference_volume
+            elif strain_gradient is not None:
+                # The Voigt basis carries a 1 in both symmetric entries, so the
+                # shear components take the same factor 1/2 as the scalar path.
+                weights = strain_gradient.new_tensor([1.0, 1.0, 1.0, 0.5, 0.5, 0.5])
+                stress = torch.einsum(
+                    "bk,kij->bij",
+                    strain_gradient * weights,
+                    _voigt_basis(pos.dtype, pos.device),
+                ) / reference_volume[:, None, None]
         return energy, forces, stress, {"atomic_energy": atomic_energy}
 
 

@@ -23,6 +23,7 @@ from mtace.checkpoint import (
 )
 from mtace.data import (
     AtomisticDataset,
+    collate_structures,
     minimum_edge_distance,
     target_statistics,
     average_num_neighbors,
@@ -97,6 +98,41 @@ OPTIMIZER_CONTRACT_KEYS = (
     "muon_include",
     "muon_exclude",
 )
+
+
+
+def _batched_forward_groups(batch, weights, report_stress_metrics):
+    """Split a batch into runs that can share one forward pass.
+
+    ``compute_stress`` is a per-call flag, so structures that disagree about it
+    cannot be merged.  Datasets are usually uniform, in which case this returns
+    a single group holding the whole batch; a mixed dataset degrades to two
+    groups rather than back to the per-structure loop.
+    """
+
+    groups = {}
+    for raw in batch:
+        include_stress = bool(raw["has_stress"]) and (
+            report_stress_metrics or weights["stress"] > 0.0
+        )
+        groups.setdefault(include_stress, []).append(raw)
+    return [(raws, flag) for flag, raws in groups.items()]
+
+
+def _split_batched_outputs(items, merged, energies, forces, stresses):
+    """Return per-structure views of a batched forward.
+
+    The views keep the autograd graph, so a loss assembled from them produces
+    exactly the gradients a per-structure loop would accumulate.
+    """
+
+    counts = [int(item["z"].numel()) for item in items]
+    force_parts = torch.split(forces, counts)
+    out = []
+    for index, item in enumerate(items):
+        stress = stresses[index] if stresses.ndim == 3 else stresses
+        out.append((item, energies[index], force_parts[index], stress))
+    return out
 
 
 def move(item, device, non_blocking=False):
@@ -385,27 +421,40 @@ def evaluate(model, loader, device, reference_values, weights, report_stress_met
     model.eval()
     totals = new_metric_accumulator(device)
     for batch in loader:
-        for raw in batch:
-            has_stress = bool(raw["has_stress"])
-            item = move(raw, device, non_blocking=device.type == "cuda")
-            include_stress = has_stress and (
-                report_stress_metrics or weights["stress"] > 0.0
-            )
-            energy, forces, stress, _ = model(
-                item, training=False, compute_stress=include_stress
-            )
-            loss, energy_error, force_error, stress_error, terms = supervised_loss(
-                energy,
-                forces,
-                stress,
-                item,
-                reference_values,
-                weights,
-                include_stress,
-            )
-            update_metric_accumulator(
-                totals, loss, energy_error, force_error, stress_error, terms
-            )
+        # Batched exactly as the training loop is; validation was otherwise the
+        # remaining per-structure bottleneck once training was batched.
+        for raws, include_stress in _batched_forward_groups(
+            batch, weights, report_stress_metrics
+        ):
+            items = [
+                move(raw, device, non_blocking=device.type == "cuda") for raw in raws
+            ]
+            if len(items) > 1:
+                merged = collate_structures(items, device=device)
+                energies, forces, stresses, _ = model(
+                    merged, training=False, compute_stress=include_stress
+                )
+                per_structure = _split_batched_outputs(
+                    items, merged, energies, forces, stresses
+                )
+            else:
+                energy, force, stress, _ = model(
+                    items[0], training=False, compute_stress=include_stress
+                )
+                per_structure = [(items[0], energy, force, stress)]
+            for item, energy, forces, stress in per_structure:
+                loss, energy_error, force_error, stress_error, terms = supervised_loss(
+                    energy,
+                    forces,
+                    stress,
+                    item,
+                    reference_values,
+                    weights,
+                    include_stress,
+                )
+                update_metric_accumulator(
+                    totals, loss, energy_error, force_error, stress_error, terms
+                )
     return finalize_metrics(totals)
 
 
@@ -1029,33 +1078,47 @@ def main():
         )
         for batch_index, batch in enumerate(training_loader, start=1):
             batch_loss = torch.zeros((), device=device)
-            for raw in batch:
-                has_stress = bool(raw["has_stress"])
-                item = move(raw, device, non_blocking=pin_memory)
-                include_stress = has_stress and (
-                    report_stress_metrics or weights["stress"] > 0.0
-                )
-                energy, forces, stress, _ = model(
-                    item, training=True, compute_stress=include_stress
-                )
-                loss, energy_error, force_error, stress_error, terms = supervised_loss(
-                    energy,
-                    forces,
-                    stress,
-                    item,
-                    reference_values,
-                    weights,
-                    include_stress,
-                )
-                update_metric_accumulator(
-                    training_totals,
-                    loss,
-                    energy_error,
-                    force_error,
-                    stress_error,
-                    terms,
-                )
-                batch_loss = batch_loss + loss / len(batch)
+            # One forward over the whole batch when every structure agrees on
+            # whether stress is included.  The model mixes atoms only through
+            # edge_index, so this is identical to the per-structure loop below --
+            # asserted in tests/test_batching.py, including the accumulated
+            # parameter gradients.  It exists because a single 40-atom structure
+            # leaves a GPU almost idle; batching is what actually feeds it.
+            grouped = _batched_forward_groups(batch, weights, report_stress_metrics)
+            for raws, include_stress in grouped:
+                items = [move(raw, device, non_blocking=pin_memory) for raw in raws]
+                if len(items) > 1:
+                    merged = collate_structures(items, device=device)
+                    energies, forces, stresses, _ = model(
+                        merged, training=True, compute_stress=include_stress
+                    )
+                    per_structure = _split_batched_outputs(
+                        items, merged, energies, forces, stresses
+                    )
+                else:
+                    energy, force, stress, _ = model(
+                        items[0], training=True, compute_stress=include_stress
+                    )
+                    per_structure = [(items[0], energy, force, stress)]
+                for item, energy, forces, stress in per_structure:
+                    loss, energy_error, force_error, stress_error, terms = supervised_loss(
+                        energy,
+                        forces,
+                        stress,
+                        item,
+                        reference_values,
+                        weights,
+                        include_stress,
+                    )
+                    update_metric_accumulator(
+                        training_totals,
+                        loss,
+                        energy_error,
+                        force_error,
+                        stress_error,
+                        terms,
+                    )
+                    batch_loss = batch_loss + loss / len(batch)
             if not bool(torch.isfinite(batch_loss.detach())):
                 raise FloatingPointError(
                     f"Nonfinite training loss at epoch {epoch}, batch {batch_index}"

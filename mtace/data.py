@@ -458,3 +458,50 @@ def baseline_energy(
     for atomic_number, energy in table.items():
         values[atomic_number] = energy
     return values[z].sum()
+
+
+def collate_structures(items, device=None):
+    """Concatenate structures into one disconnected graph for a batched forward.
+
+    Atom indices in ``edge_index`` are offset per structure so no edge crosses a
+    structure boundary.  Because nothing in the model mixes atoms except through
+    ``edge_index``, the batched evaluation is mathematically identical to
+    evaluating each structure separately -- the same property verified by the
+    additivity check ``E(A u B) = E(A) + E(B)``.
+
+    Returns a dict carrying ``batch`` (atom -> structure), a stacked
+    ``(num_graphs, 3, 3)`` cell, and per-structure ``volume``.
+    """
+
+    import torch as _torch
+
+    if not items:
+        raise ValueError("collate_structures needs at least one structure")
+    z, pos, cells, shifts, edges, batch, volumes = [], [], [], [], [], [], []
+    offset = 0
+    for graph, item in enumerate(items):
+        n = int(item["z"].numel())
+        z.append(item["z"])
+        pos.append(item["pos"])
+        cells.append(item["cell"].reshape(1, 3, 3))
+        edges.append(item["edge_index"] + offset)
+        shifts.append(item["edge_shift"])
+        batch.append(_torch.full((n,), graph, dtype=_torch.long))
+        volume = item.get("volume")
+        volumes.append(
+            _torch.as_tensor(float(volume)) if volume is not None
+            else _torch.det(item["cell"]).abs().reshape(())
+        )
+        offset += n
+    out = {
+        "z": _torch.cat(z),
+        "pos": _torch.cat(pos),
+        "cell": _torch.cat(cells),
+        "edge_index": _torch.cat(edges, dim=1),
+        "edge_shift": _torch.cat(shifts),
+        "batch": _torch.cat(batch),
+        "volume": _torch.stack(volumes).to(_torch.cat(pos).dtype),
+    }
+    if device is not None:
+        out = {k: v.to(device) for k, v in out.items()}
+    return out
