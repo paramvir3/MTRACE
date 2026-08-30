@@ -138,30 +138,65 @@ def _split_batched_outputs(items, merged, energies, forces, stresses):
 
 
 
-def configure_determinism(enabled: bool) -> str:
+def cuda_determinism_supported() -> bool:
+    """Probe whether the scatter kernels this model needs are deterministic.
+
+    The ACE density and the shell tokenizer both use ``index_add_``.  PyTorch
+    historically shipped no deterministic CUDA kernel for it, which is why this
+    file used to reject ``deterministic_algorithms: true`` on CUDA outright.
+    That is no longer true -- measured under torch 2.11.0+cu128, ``index_add_``,
+    ``scatter_add_`` and the ``index_add`` backward all run under strict
+    determinism and give bitwise identical results.
+
+    Probing beats asserting in either direction: the answer depends on the
+    installed PyTorch, so ask the installed PyTorch.
+    """
+
+    if not torch.cuda.is_available():
+        return False
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    previous = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        index = torch.zeros(8, 2, device="cuda")
+        index.index_add_(0, torch.zeros(4, dtype=torch.long, device="cuda"),
+                         torch.ones(4, 2, device="cuda"))
+        return True
+    except RuntimeError:
+        return False
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
+def configure_determinism(enabled: bool, device: torch.device) -> str:
     """Make runs reproducible, which on CUDA they are not by default.
 
     Scatter and reduction kernels on CUDA accumulate in a nondeterministic
     order, so two runs from the same seed diverge.  Measured on an RTX 5060 Ti
-    the immediate spread is tiny -- 2.8e-16 eV over five evaluations of the same
-    model, 7.5e-15 relative -- but training compounds it, so "same seed, same
-    result" does not hold and a diverging run cannot be reproduced for debugging.
+    the immediate spread is 2.8e-16 eV over five evaluations of one model,
+    7.5e-15 relative -- negligible in itself, but training compounds it, so
+    "same seed, same result" does not hold and a diverging run cannot be
+    reproduced for debugging.
 
-    Enabling deterministic algorithms fixes that, and measurement says it is
-    free here: 171.1 ms/step against 173.9 ms/step, i.e. 0.98x.  The whole
-    forward, backward and stress path has deterministic kernels available, so
-    strict mode is used rather than ``warn_only``, which would quietly permit a
-    nondeterministic kernel to slip back in.
+    Cost is nil where it is available: 171.1 ms/step with determinism against
+    173.9 ms/step without, a factor 0.98.  Strict mode is used rather than
+    ``warn_only``, which would quietly permit a nondeterministic kernel back in.
 
     ``CUBLAS_WORKSPACE_CONFIG`` must be set before cuBLAS initialises, which is
-    why this runs before any device work.  Set ``deterministic: false`` to opt
-    out on hardware where some kernel has no deterministic implementation; the
-    failure would otherwise be a RuntimeError naming the offending operator.
+    why this runs before any device work.
     """
 
     if not enabled:
         torch.use_deterministic_algorithms(False)
         return "off"
+    if device.type == "cuda" and not cuda_determinism_supported():
+        raise ValueError(
+            "deterministic_algorithms: true is not supported by this PyTorch on "
+            "CUDA, because the ACE density and shell pooling use index_add_ and "
+            "this build provides no deterministic CUDA kernel for it. Use "
+            "device: cpu for a bitwise-deterministic reference run, upgrade "
+            "PyTorch, or set deterministic_algorithms: false."
+        )
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
     if torch.backends.cudnn.is_available():
@@ -633,18 +668,7 @@ def main():
         dtype_setting = checkpoint_preview.get("model_dtype", "float32")
     model_dtype = parse_training_dtype(dtype_setting)
     deterministic = bool(config.get("deterministic_algorithms", False))
-    if deterministic and device.type == "cuda":
-        # The ACE density and the shell tokenizer both use index_add_, which has
-        # no deterministic CUDA implementation.  Failing here with an actionable
-        # message beats an opaque error after the first backward pass.
-        raise ValueError(
-            "deterministic_algorithms: true is not supported on CUDA because the "
-            "ACE density and shell pooling use index_add_, for which PyTorch "
-            "provides no deterministic CUDA kernel. Use device: cpu for a "
-            "bitwise-deterministic reference run, or set "
-            "deterministic_algorithms: false."
-        )
-    torch.use_deterministic_algorithms(deterministic)
+    determinism = configure_determinism(deterministic, device)
     if device.type == "cuda":
         allow_tf32 = bool(config.get("allow_tf32", False))
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
@@ -664,9 +688,6 @@ def main():
     batch_size = int(config.get("batch_size", 1))
     patience = int(config.get("early_stopping_patience", 20))
     num_workers = int(config.get("num_workers", 0))
-    determinism = configure_determinism(
-        bool(config.get("deterministic", True))
-    )
     clip_grad_norm = float(config.get("clip_grad_norm", 10.0))
     if epochs < 1 or batch_size < 1 or stop_after_epoch < 1:
         raise ValueError("epochs, stop_after_epoch, and batch_size must be positive")
