@@ -1,0 +1,193 @@
+# MTACE training configuration for CsPbI3 --- CUDA variant of config.yaml.
+#
+# Identical to config.yaml except for the three settings marked below, which
+# are node-specific rather than scientific: device, thread count and
+# determinism.  Every model, loss and split setting is unchanged, so results
+# remain directly comparable to the CPU reference and to the TRACE run.
+#
+# Run from this directory:
+#     python ../../train.py --config config.yaml
+#
+# The dataset is the same 979-frame CsPbI3 trajectory used by the TRACE
+# reference run (SHA256 746320f0...e399c), so accuracy numbers are directly
+# comparable.  Every frame is Cs8Pb8I24 at 40 atoms with energy, force and
+# stress labels.
+
+# ------------------------------------------------------------------------------
+# 1. DATA AND SPLIT
+# ------------------------------------------------------------------------------
+# Referenced in place rather than copied: *.extxyz is gitignored, and one copy
+# of the trajectory is enough.
+train_file: ../../examples/cspbi3/train.extxyz
+valid_file: null
+validation_fraction: 0.1
+split_mode: blocked          # neighbouring MD frames are strongly correlated
+split_block_size: 25         # contiguous frames move to validation together
+split_gap: 2                 # drop frames adjacent to a validation block
+seed: 42
+
+model_save_path: ./model.pt              # best validation epoch (EMA weights)
+save_last_checkpoint: true
+last_model_save_path: ./model_last.pt    # raw iterate, for exact resume
+resume_from: null
+restart_from: null
+
+# ------------------------------------------------------------------------------
+# 2. ARCHITECTURE
+# ------------------------------------------------------------------------------
+# The ACE frontend matches the TRACE reference (r_max, l_max, num_radial,
+# hidden_dim, correlation order and channels) so the descriptor capacity is
+# comparable and any difference is attributable to the mixer, not the descriptor.
+architecture: mtace_v2
+r_max: 6.0
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 1
+correlation_order: 4
+correlation_channels: 16
+radial_basis_type: bessel
+radial_trainable: false
+radial_mlp_hidden: 32
+radial_mlp_layers: 2
+
+# --- radial shell tokenizer ---------------------------------------------------
+tokenizer_type: physical_shells
+num_shells: 16
+shell_coupling_mode: conservative
+shell_boundary_mode: fold
+
+# shell_degree: 5 is REQUIRED here, not optional.  Cubic shell splines are C2 but
+# not C3, and their third-derivative jump is 6*((L-1)/(r_max-r_min))^3, which is
+# exactly the quantity third-order interatomic force constants are built from.
+# CsPbI3 is a strongly anharmonic halide perovskite whose octahedral tilting,
+# ultralow lattice thermal conductivity and soft-mode phase transitions all live
+# in those third derivatives, and the free-energy workflow integrates over
+# temperature through that anharmonicity.  See docs/DERIVATIVE_CONTRACT.md.
+shell_degree: 5
+
+# Measured over all 979 frames: the shortest interatomic distance is 2.680 A.
+# Uniform shells on [0, r_max] leave 4 of these 16 shells (25 percent) below any
+# distance that ever occurs, so the mixer would scan hard zeros; at L = 32 it is
+# 12 of 32.  r_min = 2.0 A leaves a 0.680 A margin and no dead shell at all.  The
+# trainer measures the margin itself and refuses to start if it is too small.
+shell_r_min: 2.0
+shell_r_min_margin: 0.25
+
+# Mean directed-neighbour count, estimated from the training split.  Without it
+# the ACE density grows linearly with coordination and the order-nu correlation
+# as n^(nu-1), so activations track density instead of chemistry.
+avg_num_neighbors: auto
+
+# --- sequence mixer -----------------------------------------------------------
+mixer_type: mamba
+mamba_variant: mamba3
+mamba_dim: 64
+mamba_d_state: 16
+mamba_expand: 2
+mamba_headdim: 16
+mamba_mimo_rank: 4
+mamba_chunk_size: 16
+mamba_rope_fraction: 0.5
+mamba_a_floor: 0.0001
+mamba_angle_mode: official
+mamba_rotary_layout: halves
+mamba_scan_mode: auto
+mamba_bidirectional_tied: false
+# The portable scan is mandatory for force and stress training: the fused CUDA
+# kernels expose no guaranteed double backward.
+mamba_backend: torch
+
+# --- coupling and readout -----------------------------------------------------
+# Degree-one invariants: even scalars are degree one in the ACE features while
+# squared norms are degree two, so a global rescaling would move the two blocks
+# by different powers and silently change the scalar/angular balance.
+invariant_norm: homogeneous
+invariant_norm_eps: 0.0001
+invariant_pair_channels: 0
+
+# Architecture-v10 expressivity terms are OFF in this baseline so it is a clean
+# reference.  config_pairs.yaml turns them on; run both and compare.
+shell_pair_channels: 0
+shell_pair_width: 1
+coupling_mode: gate
+
+ffn_hidden: 128
+ffn_type: swiglu
+readout_hidden: 64
+layer_scale_init: 0.01
+dropout: 0.03
+attention_dropout: 0.0
+
+# ------------------------------------------------------------------------------
+# 3. OPTIMIZATION
+# ------------------------------------------------------------------------------
+epochs: 100
+batch_size: 8
+device: cuda                 # GPU node (phy-tcm-pc38, RTX 5060 Ti 16 GB)
+dtype: float32
+precompute_neighbors: true
+num_workers: 0
+torch_num_threads: 4         # the GPU host has 4 cores; oversubscribing costs time
+allow_tf32: false
+deterministic_algorithms: true   # free on CUDA (0.98x) and makes the study reproducible
+clip_grad_norm: 1.0
+early_stopping_patience: 20
+report_stress_metrics: true
+gate_diagnostic_every: 5     # residual_fraction per layer; see below
+
+optimizer: muon
+learning_rate: 0.001
+minimum_learning_rate: 0.00005
+weight_decay: 0.00001
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_nesterov: true
+muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
+muon_eps: 0.0000001
+muon_ns_precision: auto
+muon_adjust_lr_fn: match_rms_adamw
+# "equivariant" also routes the per-path matrices hidden inside flattened e3nn
+# weights through Muon, raising its coverage from 82 to 88 percent of parameters.
+muon_parameter_mode: equivariant
+muon_include: []
+muon_exclude: []
+muon_aux_betas: [0.9, 0.95]
+muon_aux_eps: 0.0000000001
+
+# Averaging the optimizer trajectory. Validation, model selection and model.pt
+# use the averaged weights; model_last.pt keeps the raw iterate for exact resume.
+ema_decay: 0.999
+
+# ------------------------------------------------------------------------------
+# 4. ENERGY REFERENCE
+# ------------------------------------------------------------------------------
+# Every frame is Cs8Pb8I24, so the species-count matrix has rank 1 for 3 species
+# and per-species reference energies are NOT identifiable; a least-squares fit
+# would return an arbitrary point on a two-parameter family.  The one
+# identifiable quantity is a single per-atom offset, which is what is used here:
+# the training-set mean, -31.8596670627702 eV/atom.
+#
+# This constant cannot affect forces, stress, or any relative energy between
+# stoichiometric CsPbI3 phases, because it cancels exactly in every difference
+# per formula unit.  It only sets the zero of the absolute energy.
+solve_atomic_energies: false
+atomic_energies:
+  Cs: -31.8596670627702
+  Pb: -31.8596670627702
+  I: -31.8596670627702
+
+# ------------------------------------------------------------------------------
+# 5. LOSS
+# ------------------------------------------------------------------------------
+# normalize_loss_weights divides each squared-error term by the dataset variance
+# of its target, so the weights below are dimensionless and a term equal to 1.0
+# means "no better than predicting the mean".  Without it the raw weights are
+# dimensionful and the energy term sits orders of magnitude below the force term.
+#
+# Measured on the training split of this trajectory (the trainer prints them):
+#   sigma_E = 0.0304 eV/atom   sigma_F = 0.2638 eV/A   sigma_S = 1.408e-3 eV/A^3
+normalize_loss_weights: true
+energy_weight: 1.0
+forces_weight: 5.0           # forces carry 3N labels per frame and drive the PES
+stress_weight: 1.0           # needed for the NPT volumes the free-energy run uses
