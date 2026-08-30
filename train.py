@@ -135,6 +135,51 @@ def _split_batched_outputs(items, merged, energies, forces, stresses):
     return out
 
 
+
+def configure_worker_sharing(num_workers: int) -> None:
+    """Make ``num_workers > 0`` survive a default file-descriptor limit.
+
+    PyTorch shares worker tensors through the ``file_descriptor`` strategy on
+    Linux, spending one descriptor per shared tensor.  With precomputed
+    neighbour lists each dataset item carries several tensors and a prefetching
+    loader holds many in flight, so a stock ``ulimit -n`` of 1024 is exhausted
+    and the run dies with ``OSError: [Errno 24] Too many open files`` part-way
+    through an epoch -- late enough to waste the work already done.
+
+    Raising the soft limit to the hard limit fixes that outright and adds no new
+    machinery.  The ``file_system`` strategy is the other common remedy and is
+    *deliberately not* the default here: it routes sharing through a
+    ``torch_shm_manager`` helper process, and on a busy or core-starved host
+    that helper fails to answer in time, turning the descriptor error into
+    ``RuntimeError: Shared memory manager connection has timed out``.  Measured
+    on a contended four-core machine, switching strategy replaced one crash with
+    another.  It is kept as a fallback for hosts whose hard limit is too low for
+    the descriptor strategy to work at all.
+    """
+
+    if num_workers <= 0:
+        return
+    hard_limit = 0
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        hard_limit = hard
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, ValueError, OSError):
+        return
+    if hard_limit and hard_limit < 4096:
+        # The descriptor strategy cannot be made to fit; accept the shared
+        # memory manager and its risks rather than a certain crash.
+        try:
+            import torch.multiprocessing as multiprocessing
+
+            multiprocessing.set_sharing_strategy("file_system")
+        except (ImportError, RuntimeError, ValueError):
+            pass
+
+
 def move(item, device, non_blocking=False):
     return {
         key: value.to(device, non_blocking=non_blocking)
@@ -990,6 +1035,7 @@ def main():
             config.get("persistent_workers", False)
         )
         loader_options["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    configure_worker_sharing(num_workers)
     training_loader = DataLoader(
         training_dataset,
         shuffle=True,
