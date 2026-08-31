@@ -103,13 +103,22 @@ OPTIMIZER_CONTRACT_KEYS = (
 
 
 
-def _batched_forward_groups(batch, weights, report_stress_metrics):
+def _batched_forward_groups(batch, weights, report_stress_metrics,
+                            max_batch_atoms=None):
     """Split a batch into runs that can share one forward pass.
 
     ``compute_stress`` is a per-call flag, so structures that disagree about it
     cannot be merged.  Datasets are usually uniform, in which case this returns
     a single group holding the whole batch; a mixed dataset degrades to two
     groups rather than back to the per-structure loop.
+
+    ``max_batch_atoms`` caps how many atoms enter one forward pass.  Activation
+    memory scales with the atom count -- the state-space scan alone holds
+    O(N L d d_s) -- so on large systems an unrestricted batch exhausts the
+    device: measured on 768-atom liquid water, a Mamba mixer needs 8.6 GiB for a
+    single structure and two do not fit on a 16 GiB card.  Chunking keeps the
+    gradient identical, because the per-structure losses are summed either way;
+    only the number of forward passes changes.  ``None`` means no cap.
     """
 
     groups = {}
@@ -118,7 +127,22 @@ def _batched_forward_groups(batch, weights, report_stress_metrics):
             report_stress_metrics or weights["stress"] > 0.0
         )
         groups.setdefault(include_stress, []).append(raw)
-    return [(raws, flag) for flag, raws in groups.items()]
+    out = []
+    for flag, raws in groups.items():
+        if not max_batch_atoms:
+            out.append((raws, flag))
+            continue
+        chunk, total = [], 0
+        for raw in raws:
+            size = int(raw["z"].numel())
+            if chunk and total + size > int(max_batch_atoms):
+                out.append((chunk, flag))
+                chunk, total = [], 0
+            chunk.append(raw)
+            total += size
+        if chunk:
+            out.append((chunk, flag))
+    return out
 
 
 def _split_batched_outputs(items, merged, energies, forces, stresses):
@@ -532,14 +556,15 @@ def format_metric_line(name: str, metrics: dict[str, float]) -> str:
     )
 
 
-def evaluate(model, loader, device, reference_values, weights, report_stress_metrics=True):
+def evaluate(model, loader, device, reference_values, weights,
+             report_stress_metrics=True, max_batch_atoms=None):
     model.eval()
     totals = new_metric_accumulator(device)
     for batch in loader:
         # Batched exactly as the training loop is; validation was otherwise the
         # remaining per-structure bottleneck once training was batched.
         for raws, include_stress in _batched_forward_groups(
-            batch, weights, report_stress_metrics
+            batch, weights, report_stress_metrics, max_batch_atoms
         ):
             items = [
                 move(raw, device, non_blocking=device.type == "cuda") for raw in raws
@@ -689,6 +714,7 @@ def main():
     batch_size = int(config.get("batch_size", 1))
     patience = int(config.get("early_stopping_patience", 20))
     num_workers = int(config.get("num_workers", 0))
+    max_batch_atoms = config.get("max_batch_atoms") or None
     clip_grad_norm = float(config.get("clip_grad_norm", 10.0))
     if epochs < 1 or batch_size < 1 or stop_after_epoch < 1:
         raise ValueError("epochs, stop_after_epoch, and batch_size must be positive")
@@ -1191,7 +1217,9 @@ def main():
             # asserted in tests/test_batching.py, including the accumulated
             # parameter gradients.  It exists because a single 40-atom structure
             # leaves a GPU almost idle; batching is what actually feeds it.
-            grouped = _batched_forward_groups(batch, weights, report_stress_metrics)
+            grouped = _batched_forward_groups(
+                batch, weights, report_stress_metrics, max_batch_atoms
+            )
             for raws, include_stress in grouped:
                 items = [move(raw, device, non_blocking=pin_memory) for raw in raws]
                 if len(items) > 1:
@@ -1207,6 +1235,7 @@ def main():
                         items[0], training=True, compute_stress=include_stress
                     )
                     per_structure = [(items[0], energy, force, stress)]
+                chunk_loss = torch.zeros((), device=device)
                 for item, energy, forces, stress in per_structure:
                     loss, energy_error, force_error, stress_error, terms = supervised_loss(
                         energy,
@@ -1225,12 +1254,20 @@ def main():
                         stress_error,
                         terms,
                     )
-                    batch_loss = batch_loss + loss / len(batch)
-            if not bool(torch.isfinite(batch_loss.detach())):
-                raise FloatingPointError(
-                    f"Nonfinite training loss at epoch {epoch}, batch {batch_index}"
-                )
-            batch_loss.backward()
+                    chunk_loss = chunk_loss + loss / len(batch)
+                if not bool(torch.isfinite(chunk_loss.detach())):
+                    raise FloatingPointError(
+                        f"Nonfinite training loss at epoch {epoch}, batch {batch_index}"
+                    )
+                # Backward per chunk rather than once for the whole batch.  The
+                # gradient is identical, because the batch loss is a sum over
+                # chunks and gradients add, but each chunk's graph is released
+                # as soon as it is used.  Accumulating the graph across chunks
+                # instead would make max_batch_atoms pointless: peak memory
+                # would still scale with the whole batch, which is exactly how
+                # a 768-atom water batch exhausted a 16 GiB card.
+                chunk_loss.backward()
+                batch_loss = batch_loss + chunk_loss.detach()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 clip_grad_norm,
@@ -1264,6 +1301,7 @@ def main():
                 reference_values,
                 weights,
                 report_stress_metrics,
+                max_batch_atoms,
             )
         finally:
             if ema is not None:

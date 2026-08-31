@@ -1,0 +1,146 @@
+# MTACE on bulk liquid water (MB-pol / CCSD(T) reference set).
+#
+# Protocol follows the TRACE water run where the settings are shared -- r_max,
+# l_max, num_radial, hidden_dim, num_layers, correlation order and channels,
+# blocked split, seed, Muon, learning rate and clipping -- so descriptor
+# capacity is comparable and any difference is attributable to the mixer.
+#
+# Bulk frames only: the source trajectory mixes gas-phase clusters (3-12 atoms)
+# with periodic boxes of 256 and 512 H2O.  The question here is whether a
+# sequence model can exploit cross-shell radial structure, and only the
+# condensed phase has a second solvation shell to exploit.  Measured on these
+# frames the shell-shell cosine falls to 0.19 by two shells and goes NEGATIVE
+# by three, against 0.67 at three shells for bulk CsPbI3 -- water is the
+# favourable case, CsPbI3 was close to the least favourable.
+
+train_file: ./water_bulk.xyz
+valid_file: null
+validation_fraction: 0.1
+split_mode: blocked
+split_block_size: 25
+split_gap: 2
+seed: 42
+
+model_save_path: ./model_mamba.pt
+save_last_checkpoint: true
+last_model_save_path: ./model_mamba_last.pt
+resume_from: null
+restart_from: null
+
+architecture: mtace_v2
+r_max: 6.0
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 1
+correlation_order: 4
+correlation_channels: 16
+radial_basis_type: bessel
+radial_trainable: false
+radial_mlp_hidden: 32
+radial_mlp_layers: 2
+
+tokenizer_type: physical_shells
+num_shells: 16
+shell_coupling_mode: conservative
+shell_boundary_mode: fold
+shell_degree: 5
+
+# The covalent O-H bond sits at 0.925 A, so the inner edge must stay below it.
+# CsPbI3 could use 2.0 because its shortest contact was 2.68 A; water cannot.
+shell_r_min: 0.5
+shell_r_min_margin: 0.25
+avg_num_neighbors: auto          # ~85 directed neighbours per atom here
+
+mixer_type: mamba
+mamba_variant: mamba3
+mamba_dim: 64
+mamba_d_state: 16
+mamba_expand: 2
+mamba_headdim: 16
+mamba_mimo_rank: 4
+mamba_chunk_size: 16
+mamba_rope_fraction: 0.5
+mamba_a_floor: 0.0001
+mamba_angle_mode: official
+mamba_rotary_layout: halves
+mamba_scan_mode: auto
+mamba_bidirectional_tied: false
+mamba_backend: torch
+
+invariant_norm: homogeneous
+invariant_norm_eps: 0.0001
+invariant_pair_channels: 0
+shell_pair_channels: 0
+coupling_mode: gate
+gate_norm: none
+
+ffn_hidden: 128
+ffn_type: swiglu
+readout_hidden: 64
+layer_scale_init: 0.01
+dropout: 0.03
+attention_dropout: 0.0
+
+epochs: 100
+batch_size: 8
+# Activation memory scales with atoms per forward pass: a Mamba mixer needs
+# 8.6 GiB for one 768-atom frame, and two do not fit on a 16 GiB card.  The cap
+# chunks the batch without changing the gradient, so batch_size stays at the
+# TRACE/CsPbI3 value of 8 rather than being cut to 1 by the device.
+max_batch_atoms: 768
+device: cuda
+dtype: float32
+precompute_neighbors: true
+num_workers: 0
+torch_num_threads: 2
+allow_tf32: false
+deterministic_algorithms: true
+clip_grad_norm: 1.0
+early_stopping_patience: 20
+report_stress_metrics: false
+gate_diagnostic_every: 5
+
+optimizer: muon
+learning_rate: 0.001
+minimum_learning_rate: 0.00005
+weight_decay: 0.00001
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_nesterov: true
+muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
+muon_eps: 0.0000001
+muon_ns_precision: auto
+muon_adjust_lr_fn: match_rms_adamw
+muon_parameter_mode: equivariant
+muon_include: []
+muon_exclude: []
+muon_aux_betas: [0.9, 0.95]
+muon_aux_eps: 0.0000000001
+ema_decay: 0.999
+
+# Every bulk frame is pure H2O, so the H:O ratio is fixed at 2:1 and the
+# species-count matrix has rank 1: per-species references are NOT identifiable
+# and a least-squares fit would return an arbitrary point on a one-parameter
+# family.  The one identifiable quantity is a single per-atom offset, the
+# training-set mean, which is what is used here.  It cannot affect forces,
+# stress, or any energy difference at fixed composition -- it only sets the
+# zero.  This is the same situation stoichiometric CsPbI3 has.
+solve_atomic_energies: false
+atomic_energies:
+  H: -0.1159586826795
+  O: -0.1159586826795
+
+# Stress is DISABLED for this study, and the reason is a device limit rather
+# than a scientific one.  The frames carry a usable virial, but one 768-atom
+# structure with both force and stress training exceeds 15.5 GiB on this card:
+# the stress path adds a strain graph and a second backward on top of the
+# force double-backward, and a structure cannot be split further.  Since the
+# question here is whether the mixer exploits cross-shell structure, and stress
+# bears on neither the mixer nor the shell axis, dropping it costs nothing for
+# this comparison -- and it is dropped identically in all four arms, so the
+# comparison stays controlled.  Restore it on a larger card.
+normalize_loss_weights: true
+energy_weight: 1.0
+forces_weight: 5.0
+stress_weight: 0.0
