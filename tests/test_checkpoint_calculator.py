@@ -52,7 +52,7 @@ class CalculatorTests(unittest.TestCase):
             save_checkpoint(checkpoint, network, config, atomic_energies={1: -1.0, 8: -2.0})
             payload = load_checkpoint(checkpoint)
             self.assertEqual(payload["architecture"], "mtace_v2")
-            self.assertEqual(payload["architecture_version"], 11)
+            self.assertEqual(payload["architecture_version"], 12)
             atoms = Atoms(
                 "H2O",
                 positions=[[0.0, 0.0, 0.0], [0.95, 0.0, 0.0], [-0.2, 0.92, 0.0]],
@@ -218,6 +218,10 @@ class CalculatorTests(unittest.TestCase):
             "mamba_scan_mode": "parallel",
             "ffn_type": "swiglu",
             "invariant_pair_channels": 0,
+            # Architecture v12 changed three more; see migrated_model_config.
+            "mamba_decay_activation": "heavy_tail",
+            "cutoff_switch": "c2",
+            "gate_norm_scope": "gate",
         }
         old_model = MambaACE(**config, **historical).eval()
         payload = {

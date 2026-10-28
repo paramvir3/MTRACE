@@ -136,7 +136,9 @@ def switch_contract_order(contract: str) -> int:
         raise ValueError("contract must be 'c2' or 'c4'") from exception
 
 
-def resolve_switch_contract(contract: str, shell_degree: int) -> str:
+def resolve_switch_contract(
+    contract: str, shell_degree: int, name: str = "router_switch"
+) -> str:
     """Pick the switch that does not downgrade the model's smoothness order.
 
     A quintic shell tokenizer (``shell_degree = 5``) delivers a ``C^4`` energy.
@@ -149,7 +151,7 @@ def resolve_switch_contract(contract: str, shell_degree: int) -> str:
     if contract == "auto":
         return "c4" if int(shell_degree) >= 5 else "c2"
     if contract not in _SWITCH_ORDERS:
-        raise ValueError("router_switch must be 'auto', 'c2', or 'c4'")
+        raise ValueError(f"{name} must be 'auto', 'c2', or 'c4'")
     return contract
 
 

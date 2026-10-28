@@ -1012,4 +1012,4 @@ class TestVersion10CheckpointCompatibility:
         # v11 added the per-layer mixer schedule and expert routing.  Both are
         # inert at their defaults, so this pin moves but no v10 behaviour does;
         # tests/test_mixer_schedule.py checks a v10 config still restores exactly.
-        assert payload["architecture_version"] == 11
+        assert payload["architecture_version"] == 12

@@ -56,14 +56,14 @@ MODEL_KEYS = {
     "mamba_bidirectional_tied", "mamba_variant", "mamba_headdim",
     "mamba_rope_fraction", "mamba_a_floor", "mamba_chunk_size",
     "mamba_angle_mode", "mamba_mimo_rank", "mamba_rotary_layout",
-    "mamba_scan_mode",
+    "mamba_scan_mode", "mamba_decay_activation", "cutoff_switch",
     "mamba_backend", "ffn_hidden", "ffn_type", "invariant_pair_channels", "invariant_norm", "invariant_norm_eps",
     "invariant_overlap_width",
     "shell_pair_channels", "shell_pair_width", "shell_pair_mode",
     "decay_mode", "screening_min_angstrom",
     "shell_pair_state_clip",
     "coupling_mode", "coupling_channels",
-    "gate_norm",
+    "gate_norm", "gate_norm_scope",
     "mixer_schedule",
     "num_experts", "expert_hidden", "expert_latent_dim",
     "router_tau", "router_switch", "router_threshold_init",
@@ -310,6 +310,21 @@ def finite_nonnegative(name: str, value) -> float:
     if not math.isfinite(parsed) or parsed < 0.0:
         raise ValueError(f"{name} must be finite and nonnegative")
     return parsed
+
+
+def frames_fingerprint(frames) -> str:
+    """Short content hash of a frame set: species and positions, in order.
+
+    Printed for the validation split so that replicates of a multi-seed study
+    can be checked, from their logs alone, to have been scored on identical
+    frames.  Kept out of the run signature, which resume compares exactly.
+    """
+
+    digest = hashlib.sha256()
+    for atoms in frames:
+        digest.update(np.asarray(atoms.numbers, dtype=np.int64).tobytes())
+        digest.update(np.ascontiguousarray(atoms.positions, dtype=np.float64).tobytes())
+    return digest.hexdigest()[:16]
 
 
 def conflicting_model_settings(checkpoint: dict, requested: dict) -> list[str]:
@@ -681,6 +696,13 @@ def main():
         )
 
     seed = int(config.get("seed", 42))
+    # ``seed`` initialises the weights and the data order.  The train/validation
+    # split takes ``split_seed``, which defaults to ``seed`` so existing
+    # configurations split exactly as before.  A multi-seed study must hold
+    # ``split_seed`` fixed: otherwise every replicate is scored on a different
+    # validation set, and the seed-to-seed scatter mixes initialisation noise
+    # with split noise.
+    split_seed = int(config.get("split_seed", seed))
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -747,7 +769,7 @@ def main():
         training_frames, validation_frames, excluded_indices = split_frames(
             frames,
             validation_fraction=float(config.get("validation_fraction", 0.1)),
-            seed=seed,
+            seed=split_seed,
             mode=config.get("split_mode", "blocked"),
             block_size=int(config.get("split_block_size", 25)),
             gap=int(config.get("split_gap", 0)),
@@ -779,6 +801,10 @@ def main():
             # CanonicalMambaACE has no schedule and no routed experts.
             "mixer_schedule",
             "gate_norm",
+            "gate_norm_scope",
+            # Architecture-v12 smoothness settings exist only on MambaACEV2.
+            "mamba_decay_activation",
+            "cutoff_switch",
             "num_experts",
             "expert_hidden",
             "expert_latent_dim",
@@ -1018,7 +1044,7 @@ def main():
         "validation_frames": len(validation_frames),
         "excluded_frames": len(excluded_indices),
         "split_mode": "external" if valid_file is not None else config.get("split_mode", "blocked"),
-        "split_seed": seed,
+        "split_seed": split_seed,
         "split_block_size": int(config.get("split_block_size", 25)),
         "split_gap": int(config.get("split_gap", 0)),
         "validation_fraction": float(config.get("validation_fraction", 0.1)),
@@ -1137,7 +1163,8 @@ def main():
         f"data: train={len(training_dataset)} (stress={training_dataset.has_stress_count}) "
         f"valid={len(validation_dataset)} (stress={validation_dataset.has_stress_count}) "
         f"excluded_by_gap={len(excluded_indices)} dtype={str(model_dtype).split('.', 1)[-1]} "
-        f"determinism={determinism}",
+        f"determinism={determinism} split_seed={split_seed} "
+        f"validation_fingerprint={frames_fingerprint(validation_frames)}",
         flush=True,
     )
     print(f"best_checkpoint={output}", flush=True)
@@ -1282,14 +1309,16 @@ def main():
             report = model.gate_shell_dependence(**gate_probe)
             summary = " ".join(
                 f"L{int(entry['layer'])}:res={entry['residual_fraction']:.4f}"
+                f",mix={entry['mixing_fraction']:.4f}"
                 f",|g|={entry['gate_abs_mean']:.3f}"
                 f",sd_shell={entry['gate_std_over_shells']:.4f}"
                 for entry in report
             )
-            # residual_fraction is the share of the equivariant update that a
-            # shell-constant gate cannot reproduce.  Because sum_k T_ik = A_i, a
-            # constant gate is exactly the direct ACE path, so a value near zero
-            # means the sequence mixer is contributing nothing.
+            # res: share of the update a shell-constant gate cannot reproduce --
+            # shell-resolved gating, which the identity control also has.
+            # mix: share that exists only because shells exchange information,
+            # zero for the identity mixer.  ``mix`` is the one that tests whether
+            # the sequence model contributes; see gate_shell_dependence.
             print(f"  gate_shell_dependence {summary}", flush=True)
         if ema is not None:
             ema.store(model)

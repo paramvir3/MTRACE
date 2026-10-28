@@ -21,9 +21,15 @@ hand.  ``coupling_channels = 8`` against ``correlation_channels = 16`` is
 This module measures the bound instead of guessing it.  For each irrep order
 ``l``, stack the token features over a dataset into ``X^(l)`` of shape
 ``(N_atoms L) x (c (2l+1))``, take the singular values
-``sigma_1 >= sigma_2 >= ...`` and report the participation ratio
+``sigma_1 >= sigma_2 >= ...`` and report the entropy effective rank of Roy and
+Vetterli (2007)
 
     r_eff = exp( -sum_i p_i log p_i ) ,   p_i = sigma_i / sum_j sigma_j .
+
+(The helper keeps its historical name ``participation_ratio``, but this is not
+the participation ratio ``(sum lambda)^2 / sum lambda^2`` of the Gram
+eigenvalues: both equal ``n`` on a flat spectrum and one on a single direction,
+and they weight everything in between differently.)
 
 This is the estimator ``experiments/mixer_kernel_spectroscopy.py`` already
 applies to the mixer kernel, applied to features instead.
@@ -68,7 +74,10 @@ from e3nn import o3
 
 
 def participation_ratio(values: torch.Tensor) -> float:
-    """``exp(-sum_i p_i log p_i)`` for ``p_i = v_i / sum_j v_j``, ``v >= 0``.
+    """Entropy effective rank ``exp(-sum_i p_i log p_i)``, ``p_i = v_i / sum_j v_j``.
+
+    Applied to singular values this is the effective rank of Roy and Vetterli
+    (2007); the name is historical, see the module docstring.
 
     Returns 0.0 for an all-zero spectrum.  Equals ``n`` for ``n`` equal values
     and 1.0 when one value carries everything, so it reads as "how many

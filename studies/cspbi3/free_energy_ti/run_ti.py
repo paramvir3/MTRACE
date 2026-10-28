@@ -41,6 +41,7 @@ from ti_core import (  # noqa: E402
     crossing_temperature,
     einstein_free_energy_per_atom,
     gibbs_helmholtz_curve,
+    lattice_translation_count,
     isobaric_enthalpy_eV,
     pressure_volume_energy_eV,
     read_named_csv,
@@ -856,8 +857,21 @@ def analyze(args: argparse.Namespace, config: dict, profile: dict, run_root: Pat
         work_values = np.asarray([record["reversible_eV"] for record in work_records])
         anchor_volumes = npt_blocks[(phase, anchor_temperature)]["volume"]
         anchor_volume = float(anchor["volume_A3"])
+        # The CM correction needs the number of pure lattice translations of the
+        # tethered supercell, counted on the anchor structure itself so that a
+        # non-primitive input cell is handled too.
+        anchor_atoms = read(str(run_root / "anchor" / phase / "anchor.extxyz"))
+        translations = lattice_translation_count(
+            anchor_atoms.cell.array,
+            anchor_atoms.get_scaled_positions(wrap=True),
+            anchor_atoms.numbers,
+        )
         f_einstein = einstein_free_energy_per_atom(
-            anchor_temperature, anchor_volume, masses, springs_per_atom
+            anchor_temperature,
+            anchor_volume,
+            masses,
+            springs_per_atom,
+            lattice_translations=translations,
         )
         natoms = len(masses)
         g_anchor = (
@@ -877,6 +891,7 @@ def analyze(args: argparse.Namespace, config: dict, profile: dict, run_root: Pat
             "work_values": work_values,
             "anchor_volumes": anchor_volumes,
             "f_einstein": f_einstein,
+            "lattice_translations": translations,
             "g_anchor": g_anchor,
             "enthalpy": enthalpy,
             "gibbs": gibbs,
@@ -895,6 +910,7 @@ def analyze(args: argparse.Namespace, config: dict, profile: dict, run_root: Pat
                     "spring_Pb_eV_A2": springs_by_symbol["Pb"],
                     "spring_I_eV_A2": springs_by_symbol["I"],
                     "f_Einstein_eV_atom": f_einstein,
+                    "lattice_translations": translations,
                     "g_anchor_eV_atom": g_anchor,
                 }
             )

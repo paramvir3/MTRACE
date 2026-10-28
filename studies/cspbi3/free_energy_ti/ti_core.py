@@ -20,28 +20,93 @@ KB_EV_K = BOLTZMANN_J_K / ELECTRON_VOLT_J
 EV_PER_FORMULA_TO_KJ_MOL = 96.48533212331002
 
 
+def lattice_translation_count(
+    cell_A: np.ndarray,
+    scaled_positions: np.ndarray,
+    numbers: Sequence[int],
+    tolerance_A: float = 1.0e-2,
+) -> int:
+    """Count the pure translations that map a periodic structure onto itself.
+
+    A translation ``t`` qualifies when every atom moved by ``t`` lands, modulo
+    the supercell, within ``tolerance_A`` of an atom of the same species.  The
+    identity always qualifies, so the result is at least one.  For a supercell
+    built by repeating a primitive cell ``n1 x n2 x n3`` times this is
+    ``n1 n2 n3``; a non-primitive input cell contributes its centring
+    translations as well.  Candidate translations are taken from the species
+    with the fewest atoms, so the cost is ``O(n_min N^2)``.
+    """
+
+    cell_A = np.asarray(cell_A, dtype=float)
+    fractional = np.mod(np.asarray(scaled_positions, dtype=float), 1.0)
+    numbers = np.asarray(numbers)
+    if cell_A.shape != (3, 3) or fractional.ndim != 2 or fractional.shape[1] != 3:
+        raise ValueError("cell must be 3 x 3 and positions N x 3")
+    if len(numbers) != len(fractional) or len(numbers) == 0:
+        raise ValueError("numbers must match the positions and be nonempty")
+    if not float(tolerance_A) > 0.0:
+        raise ValueError("tolerance_A must be positive")
+    species, counts = np.unique(numbers, return_counts=True)
+    anchor_species = species[int(np.argmin(counts))]
+    anchor = fractional[numbers == anchor_species]
+    groups = [fractional[numbers == value] for value in species]
+    count = 0
+    for candidate in anchor - anchor[0]:
+        for group in groups:
+            difference = np.mod(group + candidate, 1.0)[:, None, :] - group[None, :, :]
+            difference -= np.round(difference)
+            distance = np.linalg.norm(difference @ cell_A, axis=-1)
+            if not np.all(distance.min(axis=1) < tolerance_A):
+                break
+        else:
+            count += 1
+    return count
+
+
 def einstein_free_energy_per_atom(
     temperature_K: float,
     volume_A3: float,
     masses_amu: Sequence[float],
     springs_eV_A2: Sequence[float],
+    *,
+    lattice_translations: int,
 ) -> float:
     """Return the classical Einstein-crystal Helmholtz free energy in eV/atom.
 
-    The center-of-mass correction is the one appropriate to a three-dimensional
-    periodic solid whose center of mass is constrained during Frenkel--Ladd
-    integration.  Species-dependent spring constants are supported.
+    Includes the correction for a Frenkel--Ladd integration run with the
+    centre of mass fixed.  With ``mu_i = m_i / M`` the CM of the Einstein
+    crystal is Gaussian with variance ``s^2 = sum_i mu_i^2 / (beta k_i)`` per
+    Cartesian direction, so fixing it multiplies the Einstein partition function
+    by ``(2 pi s^2)^(-3/2)``; releasing it in the real crystal multiplies by the
+    volume over which the CM may range.  That volume is ``V / n_t``, not ``V``:
+    with atoms labelled by lattice site (which is what cancels the ``1 / N!``),
+    translating the crystal by a lattice vector produces a relabelling that is
+    already counted, so the CM is confined to one of the ``n_t`` cells related
+    by the ``n_t = lattice_translations`` pure translations of the supercell.
+    Hence
+
+        F = F_E + Delta F_switch - k T ln[ (V / n_t) (2 pi s^2)^(-3/2) ] ,
+
+    which for a monatomic crystal (``n_t = N``) is the familiar
+    ``k T ln[ (N / V) (2 pi k T / (N k))^(3/2) ]`` correction of Polson et al.,
+    J. Chem. Phys. 112, 5339 (2000).  Omitting ``n_t`` biases the free energy
+    per atom by ``-k T ln(n_t) / N``; for two phases with equal ``N`` that
+    cancels only if their ``n_t`` are equal too.  Species-dependent spring
+    constants are supported.
     """
 
     temperature_K = float(temperature_K)
     volume_A3 = float(volume_A3)
     masses_amu = np.asarray(masses_amu, dtype=float)
     springs_eV_A2 = np.asarray(springs_eV_A2, dtype=float)
+    lattice_translations = int(lattice_translations)
 
     if temperature_K <= 0.0:
         raise ValueError("temperature_K must be positive")
     if volume_A3 <= 0.0:
         raise ValueError("volume_A3 must be positive")
+    if lattice_translations < 1:
+        raise ValueError("lattice_translations must be a positive integer")
     if masses_amu.ndim != 1 or springs_eV_A2.ndim != 1:
         raise ValueError("masses and springs must be one-dimensional")
     if len(masses_amu) == 0 or len(masses_amu) != len(springs_eV_A2):
@@ -64,8 +129,10 @@ def einstein_free_energy_per_atom(
 
     mass_fraction = masses_kg / np.sum(masses_kg)
     weighted_compliance = np.sum(mass_fraction**2 / springs_J_m2)
+    if lattice_translations > len(masses_amu):
+        raise ValueError("lattice_translations cannot exceed the number of atoms")
     volume_m3 = volume_A3 * ANGSTROM_M**3
-    com_partition_factor = volume_m3 * (
+    com_partition_factor = (volume_m3 / lattice_translations) * (
         beta_J_inv / (2.0 * math.pi * weighted_compliance)
     ) ** 1.5
     f_com = KB_EV_K * temperature_K * math.log(com_partition_factor)

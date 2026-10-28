@@ -9,6 +9,8 @@ import torch.nn as nn
 from e3nn import o3
 from e3nn.nn import FullyConnectedNet
 
+from .routing import switch_polynomial
+
 
 def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
     return torch.where(value > 20.0, value, value + torch.log(-torch.expm1(-value)))
@@ -39,17 +41,46 @@ def _regular_spherical_bessel_channels(
 
 
 class SmoothPolynomialCutoff(nn.Module):
-    """Compact C2 quintic envelope with value and two derivatives zero at r_max."""
+    """Compact polynomial envelope that vanishes to a stated order at ``r_max``.
 
-    def __init__(self, r_max: float):
+    ``order=2`` (default): ``(1-x)^3 (1 + 3x + 6x^2)``, value and two
+    derivatives zero at ``r_max``; its third derivative jumps from
+    ``-60 / r_max^3`` to zero there.
+
+    ``order=4``: ``(1-x)^5 (1 + 5x + 15x^2 + 35x^3 + 70x^4)``, value and four
+    derivatives zero at ``r_max``.  It is the same polynomial as the ``c4``
+    router switch and is evaluated by that code, whose expansion
+    ``tests/test_routing.py`` checks in exact integer arithmetic.
+
+    The energy's smoothness at the cutoff sphere is the order to which the
+    *edge feature* vanishes, which is the envelope order plus whatever the
+    radial channels add.  Fixed-frequency Bessel channels ``sin(n pi r/r_c)/r``
+    have their own simple zero at ``r_c`` and add one: ``order=2`` then gives a
+    ``C^3`` energy there and ``order=4`` a ``C^5`` one.  Gaussian channels, and
+    Bessel channels with trainable frequencies, add nothing: ``order=2`` gives
+    ``C^2``.  Either way ``order=2`` falls short of the ``C^4`` a quintic shell
+    tokenizer promises, which is why ``MambaACEV2`` resolves ``order=4`` for it.
+
+    Both are flat at the origin to the same order, so the inner region is
+    unaffected by the choice.
+    """
+
+    def __init__(self, r_max: float, order: int = 2):
         super().__init__()
         if r_max <= 0.0:
             raise ValueError("r_max must be positive")
+        order = int(order)
+        if order not in {2, 4}:
+            raise ValueError("cutoff order must be 2 or 4")
         self.r_max = float(r_max)
+        self.order = order
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
         x = torch.clamp(distances / self.r_max, min=0.0, max=1.0)
-        envelope = (1.0 - x).pow(3) * (1.0 + 3.0 * x + 6.0 * x.pow(2))
+        if self.order == 2:
+            envelope = (1.0 - x).pow(3) * (1.0 + 3.0 * x + 6.0 * x.pow(2))
+        else:
+            envelope = switch_polynomial(x, "c4")
         return torch.where(distances < self.r_max, envelope, torch.zeros_like(envelope))
 
 
@@ -227,9 +258,10 @@ class V2SmoothRadialBasis(nn.Module):
         basis_type: str = "bessel",
         trainable: bool = False,
         gaussian_width: float = 0.5,
+        cutoff_order: int = 2,
     ):
         super().__init__()
-        self.cutoff = SmoothPolynomialCutoff(r_max)
+        self.cutoff = SmoothPolynomialCutoff(r_max, order=cutoff_order)
         basis_type = basis_type.lower()
         if basis_type == "bessel":
             self.basis = V2BesselBasis(r_max, num_radial, trainable=trainable)
@@ -264,6 +296,7 @@ class ACEV2Descriptor(nn.Module):
         radial_mlp_hidden: int = 32,
         radial_mlp_layers: int = 2,
         avg_num_neighbors: float = 1.0,
+        cutoff_order: int = 2,
     ):
         super().__init__()
         if r_max <= 0.0:
@@ -308,13 +341,15 @@ class ACEV2Descriptor(nn.Module):
         self.irreps_out_dim = int(self.irreps_out.dim)
         self.irreps_correlation_dim = int(self.irreps_correlation.dim)
 
-        self.cutoff = SmoothPolynomialCutoff(r_max)
+        self.cutoff_order = int(cutoff_order)
+        self.cutoff = SmoothPolynomialCutoff(r_max, order=self.cutoff_order)
         self.radial_basis = V2SmoothRadialBasis(
             r_max,
             num_radial,
             basis_type=radial_basis_type,
             trainable=radial_trainable,
             gaussian_width=gaussian_width,
+            cutoff_order=self.cutoff_order,
         )
         self.sh = o3.SphericalHarmonics(
             self.irreps_sh,
@@ -437,7 +472,9 @@ def cardinal_bspline(argument: torch.Tensor, degree: int) -> torch.Tensor:
     interatomic force constants -- and therefore three-phonon scattering, lattice
     thermal conductivity, Grueneisen parameters and anharmonic phonon
     renormalization -- inherit that discontinuity.  Use ``degree=5`` for any
-    anharmonic property; see ``docs/DERIVATIVE_CONTRACT.md``.
+    anharmonic property, together with the order-4 cutoff envelope (see
+    :class:`SmoothPolynomialCutoff`): the shell knots are only one of the places
+    a third derivative can jump.  The manuscript states the full contract.
 
     Truncated powers keep the evaluation branch-free and numerically benign: the
     largest intermediate is ``3^5 = 243`` against a result of order one, so the
@@ -506,6 +543,7 @@ class CompactRadialShellBasis(nn.Module):
         r_min: float = 0.0,
         boundary_mode: str = "fold",
         degree: int = 3,
+        cutoff_order: int = 2,
     ):
         super().__init__()
         if r_max <= 0.0:
@@ -548,7 +586,7 @@ class CompactRadialShellBasis(nn.Module):
         self.num_shells = int(num_shells)
         self.shell_coupling_mode = shell_coupling_mode
         self.boundary_mode = boundary_mode
-        self.cutoff = SmoothPolynomialCutoff(r_max)
+        self.cutoff = SmoothPolynomialCutoff(r_max, order=cutoff_order)
         # Reduced shell coordinate xi_k = k / (L - 1); the physical radius of
         # shell k is r_min + (r_max - r_min) * xi_k.
         self.register_buffer(
@@ -633,6 +671,7 @@ class ACEV2MambaTokenizer(ACEV2Descriptor):
         shell_degree: int = 3,
         shell_scales: int = 1,
         avg_num_neighbors: float = 1.0,
+        cutoff_order: int = 2,
     ):
         super().__init__(
             r_max=r_max,
@@ -647,6 +686,7 @@ class ACEV2MambaTokenizer(ACEV2Descriptor):
             radial_mlp_hidden=radial_mlp_hidden,
             radial_mlp_layers=radial_mlp_layers,
             avg_num_neighbors=avg_num_neighbors,
+            cutoff_order=cutoff_order,
         )
         tokenizer_type = tokenizer_type.lower()
         if tokenizer_type not in {"physical_shells", "legacy_basis"}:
@@ -733,6 +773,7 @@ class ACEV2MambaTokenizer(ACEV2Descriptor):
             r_min=self.shell_r_min,
             boundary_mode=self.shell_boundary_mode,
             degree=self.shell_degree,
+            cutoff_order=self.cutoff_order,
         )
 
     def set_num_shells(self, num_shells: int) -> None:

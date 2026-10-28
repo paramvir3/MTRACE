@@ -6,29 +6,36 @@ correlation kernel
 
     y_k = sum_k' K(k, k') u_k' .
 
-Unrolling the state-space recurrence gives
+Unrolling one direction of the state-space recurrence gives, for k' <= k,
 
     K(k, k') = <Q_k, P_k'> exp[ -int_{xi_k'}^{xi_k} a(xi) dxi ] ,
 
-so the SSM is a *low-rank* kernel (rank <= R d_s) times a *learned exponential
-band*.  Attention is full rank with no decay prior; DeepSets is diagonal plus
-rank one; the dense mixer is an arbitrary L x L matrix; identity is the identity.
+and zero for k' > k.  That is a *semiseparable* matrix of order R d_s (Dao and
+Gu, 2024): every block lying strictly below the diagonal has rank at most
+R d_s, and the entries decay along a learned exponential band.  It is **not** a
+low-rank matrix -- the triangular truncation can make the whole kernel full
+rank even at d_s = 1 -- and the bidirectional mixer is the sum of a lower and an
+upper semiseparable part.  Attention is a dense row-stochastic mixing with no
+decay prior; DeepSets is diagonal plus rank one; the dense mixer is an arbitrary
+L x L matrix; identity is the identity.
 
-That turns the mixer ablation into a physics question with a yes/no answer:
+That turns the mixer ablation into a physics question:
 
-    Is the true radial correlation kernel low-rank and exponentially banded?
+    Is the true radial correlation kernel exponentially banded?
 
 If it is, the state-space prior is correct and should win on sample efficiency.
-If it is full rank, attention is the right choice and the SSM is a handicap.
+If it is long-ranged and unbanded, attention is the right choice and the SSM is
+a handicap.
 
 This script answers it by measuring K directly as the mixer Jacobian
 ``dy_k / du_k'``, which works uniformly for every mixer, trained or untrained.
 Two numbers summarise each kernel:
 
-* **effective rank** -- ``exp(H)`` for the Shannon entropy H of the normalised
-  singular-value spectrum.  A rank-one kernel gives 1, a full white kernel gives
-  L.  This is the participation ratio of the spectrum and is smoother than any
-  thresholded rank.
+* **effective rank** -- ``exp(H)`` for the Shannon entropy H of the singular
+  values normalised to sum to one (the effective rank of Roy and Vetterli,
+  2007).  A rank-one kernel gives 1, a flat spectrum gives L.  It is smoother
+  than any thresholded rank.  It is *not* the participation ratio
+  ``(sum s)^2 / sum s^2``, which weights the spectrum differently.
 * **band decay** -- the ratio of mean ``|K|`` on the first off-diagonal to the
   diagonal, and the exponential rate fitted to ``log mean|K_{k,k+d}|`` over d.
 
@@ -54,12 +61,26 @@ DOUBLE = torch.float64
 
 
 def mixer_kernel(layer, atoms: int, length: int, width: int, seed: int = 0):
-    """Jacobian ``dy_k / du_k'`` of the mixer, averaged over channels and atoms.
+    """Shell-to-shell kernel magnitude of the mixer's Jacobian.
 
-    The mixer is generally nonlinear, so the Jacobian is evaluated at a
-    representative operating point rather than being exact globally.  That is the
-    right object anyway: it is the linear response of the shell axis, which is
-    what "correlation kernel" means for a nonlinear map.
+        K(k, k') = < || d(y_k - u_k) / d u_k' ||_F >_atoms ,
+
+    the Frobenius norm of the ``width x width`` Jacobian block coupling input
+    shell ``k'`` to output shell ``k``, averaged over atoms.  The mixer is
+    generally nonlinear, so this is the linear response at a representative
+    operating point -- which is what "correlation kernel" means for a nonlinear
+    map.
+
+    Earlier versions differentiated ``||y_k||^2`` instead, which returns
+    ``2 (dy_k/du)^T y_k``: the Jacobian contracted with the output itself, so
+    every row was weighted by its own output magnitude.  At initialisation that
+    moved the Mamba effective rank from 0.815 L to 0.783 L; on a trained model,
+    where output magnitudes vary strongly between shells, it can do much more.
+
+    Atoms are independent sequences, so a single backward pass of
+    ``y[:, k, c].sum()`` returns row ``(k, c)`` of every atom's Jacobian at
+    once; the cost is ``length * width`` backward passes regardless of the atom
+    count.
     """
 
     torch.manual_seed(seed)
@@ -71,14 +92,20 @@ def mixer_kernel(layer, atoms: int, length: int, width: int, seed: int = 0):
     # isolates the mixing operator, which is the object the kernel taxonomy is
     # about.  For the identity mixer this correctly yields exactly zero.
     outputs = layer._mixer_states(controls, False) - controls
-    kernel = np.zeros((length, length))
+    if not outputs.requires_grad:
+        # The identity mixer returns its input, so the difference is a constant
+        # zero with no graph: its Jacobian is exactly zero.
+        return np.zeros((length, length))
+    squared = torch.zeros(atoms, length, length, dtype=DOUBLE)
     for k in range(length):
-        gradient = torch.autograd.grad(
-            outputs[:, k].pow(2).sum(), controls, retain_graph=True
-        )[0]
-        # Row k of |K| up to a positive channel-wise factor.
-        kernel[k] = gradient.norm(dim=-1).mean(dim=0).detach().numpy()
-    return kernel
+        for c in range(width):
+            row = torch.autograd.grad(
+                outputs[:, k, c].sum(), controls, retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if row is not None:
+                squared[:, k] += row.detach().square().sum(dim=-1)
+    return squared.sqrt().mean(dim=0).numpy()
 
 
 def effective_rank(kernel: np.ndarray) -> float:

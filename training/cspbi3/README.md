@@ -63,7 +63,7 @@ radius. Third-order interatomic force constants are exactly that derivative, and
 CsPbI3 is a strongly anharmonic halide perovskite whose octahedral tilting,
 ultralow lattice thermal conductivity and soft-mode transitions all live there.
 The free-energy workflow integrates across that anharmonicity. See
-[../../docs/DERIVATIVE_CONTRACT.md](../../docs/DERIVATIVE_CONTRACT.md).
+the derivative-order contract in `docs/MTACE_METHODS.tex`.
 
 **`shell_r_min: 2.0`.** Measured over all 979 frames, the shortest interatomic
 distance is 2.680 Angstrom. Uniform shells on `[0, r_max]` leave 4 of these 16

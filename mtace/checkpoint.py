@@ -139,6 +139,22 @@ def migrated_model_config(
     architecture = checkpoint.get("architecture", "mtace")
     model_config = dict(checkpoint["model_config"])
     architecture_version = int(checkpoint.get("architecture_version", 1))
+    if architecture == "mtace_v2" and architecture_version < 12:
+        # Architecture v12 changes three defaults, each of which changes the
+        # function a given parameter vector computes.  Pin all three to their v11
+        # values so an older checkpoint reproduces its trained energy, forces and
+        # stress bit-for-bit:
+        #
+        #  * ``mamba_decay_activation``: v11 used the piecewise heavy tail, which
+        #    is C^1 only; v12 defaults to its C^infinity counterpart.
+        #  * ``cutoff_switch``: v11 used the C^2 envelope for every shell degree;
+        #    v12 resolves 'auto' to C^4 for quintic shells.
+        #  * ``gate_norm_scope``: v11 normalised the state for the gate only; v12
+        #    normalises it for every saturating head.  This is inert unless
+        #    gate_norm is set *and* path-weight coupling or shell pairs are on.
+        model_config.setdefault("mamba_decay_activation", "heavy_tail")
+        model_config.setdefault("cutoff_switch", "c2")
+        model_config.setdefault("gate_norm_scope", "gate")
     # Note: there is deliberately no "< 11" migration block either.  Both v11
     # features are inert at their defaults -- ``mixer_schedule=None`` broadcasts
     # the stored scalar ``mixer_type`` to every layer, which is what v10 did, and
@@ -207,7 +223,7 @@ def migrated_model_config(
         )
         # ``ffn_type=None`` reproduces the historical coupling of the scalar
         # residual block to the mixer, so it needs no explicit migration.  New
-        # controlled comparisons should set it explicitly; see docs/BENCHMARKS.md.
+        # controlled comparisons should set it explicitly.
         historical_variant = str(model_config.get("mamba_variant", "mamba3")).lower()
         # v8 built a Mamba-3 mixer while still accepting mamba_d_conv; v9 rejects
         # that combination, so drop the inert setting rather than fail the load.

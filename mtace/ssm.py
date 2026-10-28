@@ -507,6 +507,8 @@ class EquivariantMambaACEBlock(nn.Module):
         coupling_mode: str = "gate",
         coupling_channels: int = 8,
         gate_norm: str = "none",
+        gate_norm_scope: str = "gate",
+        decay_activation: str = "heavy_tail",
         num_experts: int = 0,
         expert_hidden: int | None = None,
         expert_latent_dim: int | None = None,
@@ -700,6 +702,7 @@ class EquivariantMambaACEBlock(nn.Module):
                     scan_mode=scan_mode,
                     bidirectional_tied=bidirectional_tied,
                     backend=backend,
+                    decay_activation=decay_activation,
                 )
         elif mixer_type == "attention":
             self.mixer = AttentionSequenceMixer(
@@ -737,6 +740,17 @@ class EquivariantMambaACEBlock(nn.Module):
         decay_mode = str(decay_mode).lower()
         if decay_mode not in {"free", "screening"}:
             raise ValueError("decay_mode must be 'free' or 'screening'")
+        if decay_mode == "screening" and not (
+            mixer_type == "mamba" and mamba_variant == "mamba3"
+        ):
+            # The screened decay replaces the Mamba-3 transition exp(Delta A).
+            # No other mixer has a transition to replace, so accepting the
+            # setting would build a projection that never reaches the energy
+            # and a screening_length() that reports an untrained number.
+            raise ValueError(
+                "decay_mode='screening' requires mixer_type='mamba' with "
+                "mamba_variant='mamba3'"
+            )
         self.decay_mode = decay_mode
         self.screening_min_angstrom = float(screening_min_angstrom)
         if self.screening_min_angstrom <= 0.0:
@@ -751,10 +765,10 @@ class EquivariantMambaACEBlock(nn.Module):
         )
 
         # ---- normalisation before the gate ---------------------------------
-        # The gate is the one consumer of the mixer state that feeds a
-        # *saturating* nonlinearity, and it was the one place without a norm in
-        # front of it; the scalar residual block normalises through
-        # ``scalar_norm``.  Measured consequence on a converged CsPbI3 run: the
+        # In the default coupling (``coupling_mode='gate'``, no shell pairs) the
+        # gate is the only consumer of the mixer state, it feeds a *saturating*
+        # nonlinearity, and it was the one place without a norm in front of it;
+        # the scalar residual block normalises through ``scalar_norm``.  Measured consequence on a converged CsPbI3 run: the
         # Mamba state grew from ||m|| = 1.14 at initialisation to 6529 after 100
         # epochs while its input stayed at ~1.0, so every pre-activation reached
         # |W_g m + b| ~ 4768 and tanh saturated to +-1 everywhere.  The shell
@@ -767,9 +781,22 @@ class EquivariantMambaACEBlock(nn.Module):
         # cannot be driven into saturation by the mixer's output magnitude.
         # Default 'none' reproduces the previous architecture exactly and adds
         # no parameters.
+        #
+        # ``gate_norm_scope`` says which consumers see the normalised state.  The
+        # gate is not the only one: the path-weight coupling and every
+        # shell-pair mode also read the state through tanh (and softplus), so
+        # with ``"gate"`` -- the architecture-v11 behaviour, kept for exact
+        # checkpoint reproduction -- those heads can still be driven into the
+        # same saturation the norm exists to prevent.  ``"all"`` normalises the
+        # state once for every saturating consumer.  The mixer state feeds
+        # nothing else, so "all" leaves no unnormalised path.
         gate_norm = str(gate_norm).lower()
         if gate_norm not in {"none", "rms", "layer"}:
             raise ValueError("gate_norm must be 'none', 'rms', or 'layer'")
+        gate_norm_scope = str(gate_norm_scope).lower()
+        if gate_norm_scope not in {"gate", "all"}:
+            raise ValueError("gate_norm_scope must be 'gate' or 'all'")
+        self.gate_norm_scope = gate_norm_scope
         self.gate_norm_mode = gate_norm
         if gate_norm == "rms":
             self.gate_norm = RMSNorm(mamba_dim)
@@ -948,6 +975,12 @@ class EquivariantMambaACEBlock(nn.Module):
                 if layer_scale_init is not None
                 else None
             )
+            if self.shell_pair_scale is not None:
+                # Same role and same 1e-2 start as ``layer_scale``, which the
+                # optimizer exempts by name.  This one does not match that name
+                # rule, so without the flag weight decay would steadily switch
+                # the shell-pair branch off rather than regularise it.
+                self.shell_pair_scale._no_weight_decay = True
         self.dropout = IrrepDropout(self.node_irreps, dropout)
         self.layer_scale = (
             nn.Parameter(torch.full((self.num_node_copies,), float(layer_scale_init)))
@@ -1153,10 +1186,64 @@ class EquivariantMambaACEBlock(nn.Module):
             )
         return self.mixer(controls, require_higher_order=require_higher_order)
 
+    def _isolated_mixer_states(
+        self,
+        controls: torch.Tensor,
+        node_invariants: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The mixer applied to every shell token on its own.
+
+        Each control ``u_ik`` is fed as a sequence of length one, so every
+        per-token transformation of the mixer is kept -- projections, the
+        diagonal of the scan, the ``D`` skip, the output gate, the attention
+        value map -- and every interaction *between* shells is removed.  The
+        difference from :meth:`_mixer_states` is therefore exactly the
+        cross-shell part:
+
+        * Mamba: the off-diagonal terms of the unrolled scan, ``k' != k``.
+        * attention: ``sum_k' softmax_kk' (V_k' - V_k)``.
+        * DeepSets: the shell-mean context minus the token itself.
+        * identity: zero, identically.
+
+        Returns ``None`` for the dense mixer, whose weights are tied to the full
+        sequence length and which has no length-one form.
+        """
+
+        if self.mixer_type == "dense":
+            return None
+        atoms, length, width = controls.shape
+        flat = controls.reshape(atoms * length, 1, width)
+        if self.mixer_type == "mamba" and self.mamba_variant == "mamba3":
+            screening = None
+            if self.decay_mode == "screening":
+                lengths = self.screening_length(node_invariants)
+                screening = (self.shell_spacing_angstrom / lengths)[:, :, None]
+                screening = screening.repeat_interleave(length, dim=0)
+            states = self.mixer(
+                flat,
+                require_higher_order=False,
+                step_scale=self.step_scale,
+                screening=screening,
+            )
+        else:
+            states = self.mixer(flat, require_higher_order=False)
+        return states.reshape(atoms, length, width)
+
     def _gate_input(self, states: torch.Tensor) -> torch.Tensor:
         """States as the gate sees them; identity unless ``gate_norm`` is set."""
 
         return states if self.gate_norm is None else self.gate_norm(states)
+
+    def _head_input(self, states: torch.Tensor) -> torch.Tensor:
+        """States as the non-gate saturating heads see them.
+
+        Normalised exactly like the gate under ``gate_norm_scope='all'``; raw
+        under ``'gate'``, which reproduces architecture v11.
+        """
+
+        if self.gate_norm_scope == "all":
+            return self._gate_input(states)
+        return states
 
     def _shell_dynamics(self, states: torch.Tensor):
         """Invariant decay and drive coefficients for the shell recurrences."""
@@ -1234,6 +1321,7 @@ class EquivariantMambaACEBlock(nn.Module):
 
         if self.shell_pair_products is None:
             return None
+        states = self._head_input(states)
         atoms, length, _ = tokens.shape
         reduced = self.shell_pair_down(tokens.reshape(-1, tokens.shape[-1])).reshape(
             atoms, length, -1
@@ -1301,7 +1389,9 @@ class EquivariantMambaACEBlock(nn.Module):
         # controlled mixer comparison unfair and the two modes incomparable.  It
         # also bounds the map, which matters for molecular-dynamics stability.
         emitted = (
-            torch.tanh(self.coupling_path(states)) if weights is None else weights
+            torch.tanh(self.coupling_path(self._head_input(states)))
+            if weights is None
+            else weights
         )
         mapped = self.coupling_map(reduced, emitted.reshape(-1, emitted.shape[-1]))
         mapped = mapped.reshape(atoms, length, -1)
@@ -1328,34 +1418,69 @@ class EquivariantMambaACEBlock(nn.Module):
         node_invariants = self._node_invariants(x)
         controls = self._controls(x, tokens, token_kind, token_coordinate)
         states = self._mixer_states(controls, False, node_invariants)
+        isolated = self._isolated_mixer_states(controls, node_invariants)
         if self.coupling_mode == "path_weights":
             # The shell-constant baseline replaces the emitted weights by their
-            # mean over shells, which is exactly the map a mixer with no radial
-            # selectivity would apply; by sum_k T_ik = A_i that collapses onto the
-            # direct ACE path, so the interpretation of the residual is unchanged.
-            emitted = torch.tanh(self.coupling_path(states))
+            # mean over shells; by sum_k T_ik = A_i that collapses onto an
+            # atom-dependent linear map of the density A_i.
+            emitted = torch.tanh(self.coupling_path(self._head_input(states)))
             full = self._path_weight_update(tokens, states, emitted)
             constant = self._path_weight_update(
                 tokens, states, emitted.mean(dim=1, keepdim=True).expand_as(emitted)
             )
+            unmixed = (
+                None
+                if isolated is None
+                else self._path_weight_update(
+                    tokens,
+                    isolated,
+                    torch.tanh(self.coupling_path(self._head_input(isolated))),
+                )
+            )
             probe = emitted
         else:
-            gates = torch.tanh(self.gate_projection(self._gate_input(states)))
-            expanded = _expand_irrep_scalars(gates, self.node_blocks)
             values = self._token_values(tokens)
+
+            def gated(mixer_states: torch.Tensor) -> torch.Tensor:
+                gates = torch.tanh(self.gate_projection(self._gate_input(mixer_states)))
+                return _expand_irrep_scalars(gates, self.node_blocks)
+
+            expanded = gated(states)
             full = self._reduce_token_updates(expanded * values)
             constant = self._reduce_token_updates(
                 expanded.mean(dim=1, keepdim=True).expand_as(expanded) * values
             )
-            probe = gates
+            unmixed = (
+                None
+                if isolated is None
+                else self._reduce_token_updates(gated(isolated) * values)
+            )
+            probe = torch.tanh(self.gate_projection(self._gate_input(states)))
         full_norm = float(full.norm())
         residual = float((full - constant).norm())
+        # How large the branch is against the features it updates: the update as
+        # it is actually added, after W_O and the layer scale.  The two fractions
+        # above are shares *of this branch*, so a branch that is all mixing but
+        # tiny next to the direct ACE path still moves the energy very little.
+        added = self.output_projection(full)
+        if self.layer_scale is not None:
+            added = added * _expand_irrep_scalars(self.layer_scale, self.node_blocks)
+        feature_norm = float(x.norm())
+        mixing = (
+            float("nan")
+            if unmixed is None
+            else (float((full - unmixed).norm()) / full_norm if full_norm > 0.0 else 0.0)
+        )
         return {
             "gate_abs_mean": float(probe.abs().mean()),
             "gate_std_over_shells": float(probe.std(dim=1).mean()),
             "gate_std_over_channels": float(probe.std(dim=-1).mean()),
             "update_norm": full_norm,
             "residual_fraction": residual / full_norm if full_norm > 0.0 else 0.0,
+            "mixing_fraction": mixing,
+            "branch_fraction": (
+                float(added.norm()) / feature_norm if feature_norm > 0.0 else 0.0
+            ),
         }
 
     def _mixed_features(

@@ -41,10 +41,41 @@ def _fused_siso_accepts_rotary_divisor() -> bool:
 
 
 def heavy_tail_activation(x: torch.Tensor) -> torch.Tensor:
-    """Positive data-dependent decay magnitude used by official Mamba-3."""
+    """Positive data-dependent decay magnitude, piecewise form.
+
+    ``f(x) = x + 1`` for ``x >= 0`` and ``1 / (1 - x)`` for ``x < 0``.  Value and
+    first derivative match at the join (both equal one), but the second
+    derivative jumps from ``f''(0^-) = 2`` to ``f''(0^+) = 0``, so this function
+    is only ``C^1``.  Its argument is a linear map of position-dependent
+    invariants, so the energy inherits that: the Hessian -- harmonic force
+    constants -- is discontinuous wherever any (atom, shell, head) entry crosses
+    zero, and third derivatives carry a delta function there.  Retained for
+    exact reproduction of architecture-v11 and earlier checkpoints; new models
+    use :func:`smooth_heavy_tail_activation`.
+    """
     negative = x.clamp_max(0.0)
     positive = x.clamp_min(0.0)
     return positive + torch.reciprocal(1.0 - negative)
+
+
+def smooth_heavy_tail_activation(x: torch.Tensor) -> torch.Tensor:
+    """Analytic counterpart of :func:`heavy_tail_activation`.
+
+        f(x) = ( x + sqrt(x^2 + 4) ) / 2  =  exp( asinh(x / 2) ) .
+
+    It keeps every property the piecewise form was chosen for -- ``f > 0``,
+    ``f(0) = 1``, the reciprocal symmetry ``f(-x) = 1 / f(x)``, and the same
+    asymptotes ``f ~ x`` as ``x -> +inf`` and ``f ~ 1 / |x|`` as ``x -> -inf``,
+    so the decay rate can only approach zero algebraically (the heavy tail)
+    -- and it is ``C^infinity``.  Its derivatives are bounded everywhere:
+    ``0 < f' = (1 + x / sqrt(x^2 + 4)) / 2 < 1`` and ``0 < f'' = 2 (x^2 + 4)^(-3/2) <= 1/4``.
+    The only property not kept is the slope at the origin, ``f'(0) = 1/2``
+    instead of one, which the preceding learned projection absorbs.
+    """
+    return 0.5 * (x + torch.sqrt(x.square() + 4.0))
+
+
+_DECAY_ACTIVATIONS = {"heavy_tail", "smooth"}
 
 
 def mamba3_angle_increments(
@@ -504,8 +535,13 @@ class Mamba3Direction(nn.Module):
         rotary_layout: str = "halves",
         scan_mode: str = "auto",
         backend: str = "auto",
+        decay_activation: str = "heavy_tail",
     ):
         super().__init__()
+        decay_activation = str(decay_activation).lower()
+        if decay_activation not in _DECAY_ACTIVATIONS:
+            raise ValueError("decay_activation must be 'heavy_tail' or 'smooth'")
+        self.decay_activation = decay_activation
         if d_model < 1 or d_state < 2 or expand < 1 or headdim < 1:
             raise ValueError("Mamba-3 dimensions must be positive and d_state at least two")
         if d_state % 2 != 0:
@@ -717,9 +753,17 @@ class Mamba3Direction(nn.Module):
             )
             dt = dt * scale.to(device=dt.device, dtype=accumulation_dtype)
         if screening is None:
-            decay = -heavy_tail_activation(raw_A.to(accumulation_dtype)).clamp_min(
-                self.a_floor
-            )
+            if self.decay_activation == "heavy_tail":
+                decay = -heavy_tail_activation(raw_A.to(accumulation_dtype)).clamp_min(
+                    self.a_floor
+                )
+            else:
+                # Additive rather than clamped floor: clamp_min is itself a C^0
+                # kink, and the point of this branch is a C^infinity decay.
+                decay = -(
+                    self.a_floor
+                    + smooth_heavy_tail_activation(raw_A.to(accumulation_dtype))
+                )
             adt = decay * dt
         else:
             # Physically constrained decay.  Instead of a free per-head rate, the
@@ -872,6 +916,7 @@ class Mamba3SequenceMixer(nn.Module):
         scan_mode: str = "auto",
         bidirectional_tied: bool = False,
         backend: str = "auto",
+        decay_activation: str = "heavy_tail",
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -890,6 +935,7 @@ class Mamba3SequenceMixer(nn.Module):
             rotary_layout=rotary_layout,
             scan_mode=scan_mode,
             backend=backend,
+            decay_activation=decay_activation,
         )
         self.forward_direction = Mamba3Direction(**direction_kwargs)
         self.backward_direction = (
@@ -919,9 +965,18 @@ class Mamba3SequenceMixer(nn.Module):
             if self.backward_direction is None:
                 raise RuntimeError("untied bidirectional mixer has no backward direction")
             reverse_direction = self.backward_direction
+        # ``screening`` is one length per atom, constant along the shell axis, so
+        # reversing the sequence leaves it unchanged and it is passed through as
+        # is.  Omitting it here used to give the reverse scan the *free* decay:
+        # decay_mode='screening' then constrained only half of the recurrence,
+        # and the reverse half kept a per-head learned rate that the screened
+        # model is not supposed to have.
         backward = torch.flip(
             reverse_direction(
-                torch.flip(normalized, dims=(1,)), require_higher_order, step_scale
+                torch.flip(normalized, dims=(1,)),
+                require_higher_order,
+                step_scale,
+                screening,
             ),
             dims=(1,),
         )

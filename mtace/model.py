@@ -11,7 +11,7 @@ import torch.nn as nn
 from e3nn import o3
 
 from .physics import ACEV2MambaTokenizer, CanonicalACETokenizer
-from .routing import resolve_switch_contract
+from .routing import resolve_switch_contract, switch_contract_order
 from .schedule import resolve_mixer_schedule
 from .ssm import EquivariantMambaACEBlock
 
@@ -383,7 +383,23 @@ class MambaACEV2(CanonicalMambaACE):
     # the scalar ``mixer_type`` exactly as before, and ``num_experts=0`` leaves
     # the block arithmetic untouched -- so a v10 checkpoint reproduces its
     # trained energy with no migration.  See ``migrated_model_config``.
-    architecture_version = 11
+    #
+    # v12 makes the derivative-order contract true for the whole model rather
+    # than for the shell tokenizer alone.  Two components capped it below what
+    # the shell degree promised:
+    #
+    #  * the Mamba-3 decay activation was only C^1 (``f''`` jumps 2 -> 0 at the
+    #    origin), so even a cubic-shell model had a discontinuous Hessian; and
+    #  * the radial cutoff envelope was C^2 at r_max for every shell degree, so a
+    #    quintic model was only C^3 at the cutoff sphere with the fixed Bessel
+    #    channels (whose sine adds one zero) and only C^2 with Gaussian or
+    #    trainable-frequency channels -- short of the C^4 its shells promise.
+    #
+    # It also extends ``gate_norm`` to every saturating consumer of the mixer
+    # state.  All three change the function a parameter vector computes, so
+    # ``migrated_model_config`` pins each to its v11 value for older
+    # checkpoints, which therefore still restore bit-for-bit.
+    architecture_version = 12
 
     def __init__(
         self,
@@ -425,7 +441,9 @@ class MambaACEV2(CanonicalMambaACE):
         mamba_mimo_rank: int = 4,
         mamba_rotary_layout: str = "halves",
         mamba_scan_mode: str = "auto",
+        mamba_decay_activation: str = "smooth",
         mamba_backend: str = "auto",
+        cutoff_switch: str = "auto",
         ffn_hidden: int | None = None,
         ffn_type: str | None = None,
         invariant_pair_channels: int = 0,
@@ -441,6 +459,7 @@ class MambaACEV2(CanonicalMambaACE):
         coupling_mode: str = "gate",
         coupling_channels: int = 8,
         gate_norm: str = "none",
+        gate_norm_scope: str = "all",
         num_experts: int = 0,
         expert_hidden: int | None = None,
         expert_latent_dim: int | None = None,
@@ -489,6 +508,19 @@ class MambaACEV2(CanonicalMambaACE):
         # A quintic shell tokenizer delivers a C^4 energy; routing it with the
         # C^2 switch would quietly downgrade the whole model to C^2.
         resolved_switch = resolve_switch_contract(router_switch, shell_degree)
+        # The radial envelope must vanish to the same order.  It multiplies every
+        # edge feature, so a C^2 envelope makes the energy C^2 at the cutoff
+        # sphere no matter how smooth the shells are.  'auto' follows the shell
+        # degree exactly as the router switch does: cubic models are unchanged,
+        # quintic models get the C^4 envelope their contract requires.
+        self.cutoff_switch = resolve_switch_contract(
+            cutoff_switch, shell_degree, name="cutoff_switch"
+        )
+        cutoff_order = switch_contract_order(self.cutoff_switch)
+        # Validated here, not only inside the Mamba-3 direction, so a misspelt
+        # value is rejected even when no layer of the schedule is Mamba-3.
+        if str(mamba_decay_activation).lower() not in {"heavy_tail", "smooth"}:
+            raise ValueError("mamba_decay_activation must be 'heavy_tail' or 'smooth'")
         self.r_max = float(r_max)
         self.hidden_dim = int(hidden_dim)
         if shell_coupling_mode is None:
@@ -515,6 +547,36 @@ class MambaACEV2(CanonicalMambaACE):
                 "replaces the depthwise convolution by its trapezoidal state "
                 "injection.  Remove mamba_d_conv or select mamba_variant='mamba1'."
             )
+        decay_mode = str(decay_mode).lower()
+        # Validated here because the per-layer resolution below maps anything
+        # that is not 'screening' to 'free'; a misspelt mode would otherwise be
+        # trained as the free decay without a word.
+        if decay_mode not in {"free", "screening"}:
+            raise ValueError("decay_mode must be 'free' or 'screening'")
+        # The screened decay is exp(-dr / lambda) with one physical spacing dr.
+        # A multiresolution sequence has a different spacing on every scale and
+        # jumps from r_max back to r_min at each scale boundary, so no single dr
+        # -- and no Yukawa reading of the kernel -- describes it.
+        if decay_mode == "screening" and int(shell_scales) > 1:
+            raise ValueError(
+                "decay_mode='screening' requires shell_scales=1: the screened "
+                "kernel exp(-|r_k - r_k'| / lambda) needs one uniform radial axis"
+            )
+        # Only a Mamba-3 layer has a transition for the screening to replace, so
+        # in a hybrid schedule the attention (or other) layers keep their own
+        # mixer untouched.  A schedule with no Mamba-3 layer at all cannot honour
+        # the request, and saying so beats silently training a free model.
+        screened_layers = [
+            decay_mode == "screening"
+            and entry == "mamba"
+            and str(mamba_variant).lower() == "mamba3"
+            for entry in schedule
+        ]
+        if decay_mode == "screening" and not any(screened_layers):
+            raise ValueError(
+                "decay_mode='screening' needs at least one mixer_type='mamba' "
+                "layer with mamba_variant='mamba3'"
+            )
         self.continuum_mode = bool(continuum_mode)
         self.species_embedding = nn.Embedding(119, hidden_dim, padding_idx=0)
         self.ace = ACEV2MambaTokenizer(
@@ -537,6 +599,7 @@ class MambaACEV2(CanonicalMambaACE):
             shell_boundary_mode=shell_boundary_mode,
             shell_degree=shell_degree,
             shell_scales=shell_scales,
+            cutoff_order=cutoff_order,
         )
         # Reference resolution for the continuum quadrature.  Every continuum
         # rescaling equals one at this resolution, so architecture v9 with
@@ -583,17 +646,17 @@ class MambaACEV2(CanonicalMambaACE):
                     shell_pair_width=shell_pair_width,
                     shell_pair_mode=shell_pair_mode,
                     shell_pair_state_clip=shell_pair_state_clip,
-                    decay_mode=decay_mode,
+                    decay_mode="screening" if screened else "free",
                     screening_min_angstrom=screening_min_angstrom,
                     # Physical shell spacing in Angstrom.  The screened decay is
                     # exp(-dr / lambda), so this factor is what makes lambda an
                     # Angstrom-valued observable rather than a per-shell number.
-                    shell_spacing_angstrom=(
-                        (float(r_max) - float(shell_r_min)) / max(1, int(num_shells) - 1)
-                    ),
+                    shell_spacing_angstrom=self._shell_spacing_angstrom(),
                     coupling_mode=coupling_mode,
                     coupling_channels=coupling_channels,
                     gate_norm=gate_norm,
+                    gate_norm_scope=gate_norm_scope,
+                    decay_activation=mamba_decay_activation,
                     num_experts=num_experts,
                     expert_hidden=expert_hidden,
                     expert_latent_dim=expert_latent_dim,
@@ -608,11 +671,24 @@ class MambaACEV2(CanonicalMambaACE):
                     layer_scale_init=layer_scale_init,
                     backend=mamba_backend,
                 )
-                for layer_mixer in schedule
+                for layer_mixer, screened in zip(schedule, screened_layers)
             ]
         )
         self.readout = V2ScalarEnergyReadout(hidden_dim, readout_hidden)
         self._apply_resolution_scaling()
+
+    def _shell_spacing_angstrom(self) -> float:
+        """Physical spacing ``dr = (r_max - r_min) / (L - 1)`` of the current mesh.
+
+        Read from the tokenizer rather than from the constructor arguments, so
+        it follows :meth:`set_num_shells`.  The screened decay is
+        ``exp(-dr / lambda)`` per step; a stale ``dr`` after re-gridding would
+        rescale every screening length by ``(L_new - 1) / (L_old - 1)``.
+        """
+
+        return (float(self.r_max) - float(self.ace.shell_r_min)) / max(
+            1, int(self.ace.num_shells) - 1
+        )
 
     def _apply_resolution_scaling(self) -> None:
         """Propagate the radial-metric factors for the current shell mesh.
@@ -626,7 +702,7 @@ class MambaACEV2(CanonicalMambaACE):
         ``T_ik / dxi`` has no continuum limit -- refining the mesh resolves
         individual neighbors and the density grows like ``1 / dxi`` at each
         neighbor distance.  Measured gate fields diverge accordingly
-        (``docs/RESOLUTION_STUDY.md``).  A true continuum limit needs a pooling
+        (manuscript, Limitations).  A true continuum limit needs a pooling
         kernel whose physical width is decoupled from the shell spacing, which
         also forfeits the four-shell sparsity of the current tokenizer.
 
@@ -654,7 +730,7 @@ class MambaACEV2(CanonicalMambaACE):
         No learned tensor depends on the shell count for the ``mamba``,
         ``attention``, ``mlp`` and ``identity`` mixers, so the radial mesh can be
         refined or coarsened after training.  This is a **research tool, not a
-        deployment feature**: the measured study in ``docs/RESOLUTION_STUDY.md``
+        deployment feature**: the measured study in the manuscript's Limitations
         shows that the energy of a fixed parameter vector drifts by a small but
         *growing* amount under refinement rather than converging, so the shell
         count is a genuine hyperparameter.  Always revalidate a re-gridded model.
@@ -667,8 +743,10 @@ class MambaACEV2(CanonicalMambaACE):
                     "and cannot be re-gridded"
                 )
         self.ace.set_num_shells(num_shells)
+        spacing = self._shell_spacing_angstrom()
         for layer in self.layers:
             layer.sequence_length = int(self.ace.sequence_length)
+            layer.shell_spacing_angstrom = spacing
         self._apply_resolution_scaling()
 
     @contextlib.contextmanager
@@ -697,9 +775,12 @@ class MambaACEV2(CanonicalMambaACE):
         edge_index: torch.Tensor,
         edge_shift: torch.Tensor,
     ) -> list[torch.Tensor]:
-        """Per-atom screening length in Angstrom, one tensor per layer.
+        """Per-atom screening length in Angstrom, one tensor per screened layer.
 
-        Only defined for ``decay_mode='screening'``.  This is the quantity the
+        Only defined for ``decay_mode='screening'``.  In a hybrid schedule only
+        the Mamba-3 layers carry a screened decay, so the list holds one entry
+        per such layer, in stack order; the other layers are stepped through
+        but report nothing.  This is the quantity the
         constrained decay makes physical: the recurrence memory is
         ``exp(-|r_k - r_k'| / lambda_i)``, so ``lambda_i`` is a screened
         correlation length and can be compared directly against a Thomas-Fermi
@@ -718,14 +799,17 @@ class MambaACEV2(CanonicalMambaACE):
             features, tokens, token_kind, token_coordinate = self.ace(
                 self.species_embedding(z), edge_index, edge_vec, edge_len
             )
-            for layer in self.layers:
-                if layer.decay_mode != "screening":
-                    raise RuntimeError(
-                        "screening_lengths requires decay_mode='screening'"
-                    )
-                report.append(
-                    layer.screening_length(layer._node_invariants(features)).squeeze(-1)
+            if not any(layer.decay_mode == "screening" for layer in self.layers):
+                raise RuntimeError(
+                    "screening_lengths requires decay_mode='screening'"
                 )
+            for layer in self.layers:
+                if layer.decay_mode == "screening":
+                    report.append(
+                        layer.screening_length(
+                            layer._node_invariants(features)
+                        ).squeeze(-1)
+                    )
                 features = layer(features, tokens, token_kind, token_coordinate)
         return report
 
@@ -737,19 +821,33 @@ class MambaACEV2(CanonicalMambaACE):
         edge_index: torch.Tensor,
         edge_shift: torch.Tensor,
     ) -> list[dict[str, float]]:
-        """Measure how much of the mixer update is *not* reproducible by ACE.
+        """Measure how shell-resolved the update is, and how much is mixing.
 
-        Because ``sum_k T_ik = A_i``, a gate that is constant across shells makes
-        the equivariant update equal to ``W_O W_V A_i``, which the direct ACE
-        path of the manuscript already contains.  All of the additional
-        expressivity of the mixer therefore lives in the shell dependence of the
-        gate.  This diagnostic reports, per layer,
+        Two fractions are reported per layer, and they answer different
+        questions.
 
-        ``residual_fraction = || dh - dh_const || / || dh ||``
+        ``residual_fraction = || dh - dh_const || / || dh ||``, where
+        ``dh_const`` replaces every gate by its mean over shells.  Because
+        ``sum_k T_ik = A_i``, a shell-constant gate makes the update
+        ``g_i W_V A_i``: an *atom-dependent* invariant gate on the density.  That
+        is not plain ACE -- ``g_i`` is a nonlinear function of the environment --
+        but it needs no radial sequence at all, so a value near zero means the
+        shell resolution of this branch is unused.  A *positive* value does
+        **not** show that the mixer does anything: the controls already depend
+        on the shell through ``J(T_ik)`` and ``xi_k``, so the identity control
+        has shell-dependent gates too (measured ``R = 0.347`` on CsPbI3).
 
-        where ``dh_const`` replaces every gate by its mean over shells.  A value
-        near zero means the mixer is decorative and the model has degenerated to
-        plain ACE; the quantity should grow during training.
+        ``mixing_fraction = || dh - dh_isolated || / || dh ||``, where
+        ``dh_isolated`` re-evaluates the mixer on every shell token as a sequence
+        of length one (see ``_isolated_mixer_states``).  That keeps every
+        per-token transformation and removes every interaction between shells,
+        so this is the share of the update that exists *only* because shells
+        communicate.  It is identically zero for the identity mixer and is the
+        quantity that tests the central claim.  ``nan`` for the dense mixer,
+        which has no length-one form.
+
+        Both cover the gate (or path-weight) branch only, not the optional
+        shell-pair branch.
         """
 
         report: list[dict[str, float]] = []

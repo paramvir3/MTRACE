@@ -293,7 +293,7 @@ class DensityNormalizationTests(unittest.TestCase):
 class ResolutionTests(unittest.TestCase):
     """Re-gridding is a valid research operation with a *bounded*, not vanishing, drift.
 
-    The measured study in ``docs/RESOLUTION_STUDY.md`` shows that refining the
+    The measured study in the manuscript's Limitations shows that refining the
     shell mesh of a fixed parameter vector changes the energy by an amount that
     grows slowly instead of converging.  The shell count is therefore a genuine
     hyperparameter and a re-gridded model must be revalidated.  What these tests

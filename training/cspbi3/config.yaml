@@ -58,7 +58,10 @@ shell_boundary_mode: fold
 # CsPbI3 is a strongly anharmonic halide perovskite whose octahedral tilting,
 # ultralow lattice thermal conductivity and soft-mode phase transitions all live
 # in those third derivatives, and the free-energy workflow integrates over
-# temperature through that anharmonicity.  See docs/DERIVATIVE_CONTRACT.md.
+# temperature through that anharmonicity.  From architecture v12 the model
+# also resolves the C^4 cutoff envelope for quintic shells automatically
+# (cutoff_switch: auto).  See the derivative-order contract in
+# docs/MTACE_METHODS.tex.
 shell_degree: 5
 
 # Measured over all 979 frames: the shortest interatomic distance is 2.680 A.

@@ -262,7 +262,7 @@ class HybridCheckpointTests(unittest.TestCase):
         config["router_tau"] = 0.5
         torch.manual_seed(17)
         network = MambaACEV2(**config).double().eval()
-        self.assertEqual(network.architecture_version, 11)
+        self.assertEqual(network.architecture_version, 12)
         reference = network(data(POSITIONS), compute_stress=False)[0]
 
         with tempfile.TemporaryDirectory() as directory:
@@ -270,7 +270,7 @@ class HybridCheckpointTests(unittest.TestCase):
             save_checkpoint(path, network, config, atomic_numbers=[1, 8])
             restored, checkpoint = restore_model(path)
 
-        self.assertEqual(int(checkpoint["architecture_version"]), 11)
+        self.assertEqual(int(checkpoint["architecture_version"]), 12)
         self.assertEqual(
             [layer.mixer_type for layer in restored.layers],
             ["mamba", "attention", "mamba"],
@@ -284,11 +284,22 @@ class HybridCheckpointTests(unittest.TestCase):
         )
 
     def test_a_v10_configuration_still_loads_without_migration(self):
-        """v11 is additive: neither new setting appears in a v10 config."""
+        """v11 is additive: neither new setting appears in a v10 config.
+
+        v12 is not additive -- it changes three defaults -- so the reference is
+        built with the arithmetic a v10/v11 model actually had, and the stored
+        configuration omits those keys exactly as v10 code wrote it.  The v12
+        migration must then reproduce the reference from the stored config.
+        """
 
         config = dict(SETTINGS)
         torch.manual_seed(17)
-        network = MambaACEV2(**config).double().eval()
+        network = MambaACEV2(
+            **config,
+            mamba_decay_activation="heavy_tail",
+            cutoff_switch="c2",
+            gate_norm_scope="gate",
+        ).double().eval()
         reference = network(data(POSITIONS), compute_stress=False)[0]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.pt"

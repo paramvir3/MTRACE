@@ -1,39 +1,47 @@
 """Per-layer mixer schedules: a Mamba stack with sparse attention anchors.
 
-Unrolling the state-space recurrence over the shell axis gives the radial
-correlation kernel
+Unrolling one direction of the state-space recurrence over the shell axis gives
+the radial correlation kernel
 
     y_k = sum_k' K(k, k') u_k' ,
-    K(k, k') = <Q_k, P_k'> exp[ -int_{xi_k'}^{xi_k} a(xi) dxi ] ,
+    K(k, k') = <Q_k, P_k'> exp[ -int_{xi_k'}^{xi_k} a(xi) dxi ] ,  k' <= k,
 
-so a state-space mixer is a *low-rank* kernel -- rank at most ``R d_s`` -- times
-a *learned exponential band*.  Attention carries neither constraint.  They are
-different priors on the same object, and ``experiments/mixer_kernel_spectroscopy.py``
-measures which one each mixer realises at initialisation:
+and zero above the diagonal.  That is a *semiseparable* matrix of order
+``R d_s`` (Dao and Gu, 2024) -- every block strictly below the diagonal has rank
+at most ``R d_s`` -- with a learned exponential band.  It is not a low-rank
+matrix: the triangular truncation can make it full rank, which is why Mamba
+measures as the *higher*-rank mixer below.  Attention is a dense row-stochastic
+mixing with no decay prior.  They are different priors on the same object, and
+``experiments/mixer_kernel_spectroscopy.py`` measures the Jacobian each mixer
+realises at initialisation (L = 16; ``results/kernel_spectroscopy.json``):
 
     mixer      eff. rank / L    band decay
     identity         0.000            --
-    mamba            0.783         0.255
-    attention        0.366         0.087
+    mamba            0.815         0.259
+    attention        0.370         0.089
 
-Mamba is banded and comparatively high rank; attention is low rank and
+Mamba is banded and comparatively high rank; attention is lower rank and
 essentially unbanded.  Neither dominates, which is the situation in which a
-mixed stack can beat either pure stack.
+mixed stack *can* beat either pure stack -- a precondition, not a result.
 
-The cost argument runs the same way.  At the shell counts used here, L = 16..32,
-attention costs O(L^2 d) ~ 1.6e4 MAC per atom, and measured against the identity
-control attention runs at 1.5x while Mamba runs at 6-10x.  Replacing a Mamba
-layer with an attention layer makes the model *cheaper*.
+Cost.  At the shell counts used here, L = 16..32, attention costs O(L^2 d), about
+1.6e4 multiply-adds per atom at L = 16, d = 64, against O(L R d d_s) for the
+scan, and the crossover is near L = R d_s.  Wall-time ratios are hardware
+dependent: measured on CsPbI3 against the identity control, attention ran at
+1.2x and Mamba at 17x on CPU, and at 0.74x and 1.1x on CUDA.  Replacing a Mamba
+layer by an attention layer never made the model more expensive.
 
-Physics risk is nil: every mixer in this module consumes only O(3)-invariant
-controls and every one is smooth, so symmetry, energy conservation and the
-derivative-order contract do not depend on the choice.  What the schedule
-changes is the inductive bias, and only that.
+Physics: every mixer consumes only O(3)-invariant controls, so symmetry and
+energy conservation cannot depend on the choice.  Smoothness can, and did: the
+v11 Mamba-3 decay activation was only C^1, which broke the Hessian of every
+Mamba-3 layer; architecture v12 replaces it by an analytic one, after which
+every mixer is C^infinity and the contract is set by the tokenizer.
 
-Honest scope: the converged multi-seed mixer study on the full dataset is still
-open, and in the three-seed pilot (``docs/PILOT_RESULTS.md``) no mixer is
-distinguishable from the identity control.  The schedule is cheap and safe; it
-is not yet known to be necessary.
+Honest scope: the converged single-seed comparison on CsPbI3 found no mixer
+distinguishable from the identity control, and no hybrid schedule has yet been
+trained against the pure stacks.  The schedule is cheap and safe; it is not yet
+known to be useful.  ``gate_shell_dependence`` reports a ``mixing_fraction``
+that measures directly whether a trained stack uses cross-shell communication.
 """
 
 from __future__ import annotations
