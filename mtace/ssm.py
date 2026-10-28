@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 
+from torch.utils.checkpoint import checkpoint as _checkpoint
+
 from .mamba3 import Mamba3SequenceMixer, affine_shell_scan
 from .mixers import (
     AttentionSequenceMixer,
@@ -509,6 +511,9 @@ class EquivariantMambaACEBlock(nn.Module):
         gate_norm: str = "none",
         gate_norm_scope: str = "gate",
         decay_activation: str = "heavy_tail",
+        coordinate_features: str = "linear",
+        coordinate_harmonics: int = 4,
+        mixer_checkpoint: bool = False,
         num_experts: int = 0,
         expert_hidden: int | None = None,
         expert_latent_dim: int | None = None,
@@ -639,7 +644,45 @@ class EquivariantMambaACEBlock(nn.Module):
         self.node_context = nn.Linear(node_invariant_dim, mamba_dim, bias=False)
         self.token_input = nn.Linear(token_invariant_dim, mamba_dim, bias=False)
         self.kind_embedding = nn.Embedding(num_token_kinds, mamba_dim)
-        self.coordinate_projection = nn.Linear(1, mamba_dim, bias=False)
+        # ---- how the shell coordinate enters the control -------------------
+        # "linear":  W_xi xi_k.  Attention logits are then bilinear in the two
+        #            shells' coordinates, q_k . k_k' ~ a xi_k xi_k' + b xi_k +
+        #            c xi_k' + d, which cannot express "attend to shells within
+        #            a distance" -- the measured attention kernel at
+        #            initialisation is essentially unbanded (decay 0.09 against
+        #            0.26 for the recurrence, whose band comes from the scan
+        #            itself).  The data terms J(T_ik) break the degeneracy only
+        #            as far as the environment happens to vary with k.
+        # "fourier": [xi, sin(pi m xi), cos(pi m xi)]_{m=1..M}.  Products of
+        #            these span cos(pi m (xi_k - xi_k')), so a logit that is a
+        #            function of shell separation becomes a linear map away.
+        #            Every feature is C^infinity in xi, and xi_k is a fixed
+        #            property of shell k, so symmetry and the derivative-order
+        #            contract are untouched; only the mixer's inductive bias
+        #            changes.  The recurrence does not need it, but gets it too
+        #            so that the control sequence is identical across mixers.
+        coordinate_features = str(coordinate_features).lower()
+        if coordinate_features not in {"linear", "fourier"}:
+            raise ValueError("coordinate_features must be 'linear' or 'fourier'")
+        coordinate_harmonics = int(coordinate_harmonics)
+        if coordinate_features == "fourier" and coordinate_harmonics < 1:
+            raise ValueError("coordinate_harmonics must be positive")
+        self.coordinate_features = coordinate_features
+        self.coordinate_harmonics = coordinate_harmonics
+        coordinate_width = (
+            1 if coordinate_features == "linear" else 1 + 2 * coordinate_harmonics
+        )
+        self.coordinate_projection = nn.Linear(coordinate_width, mamba_dim, bias=False)
+        # ---- activation checkpointing of the mixer ----------------------------
+        # The portable scan keeps O(N L H P N_s) state for reverse mode, and
+        # force training differentiates through it twice.  Recomputing the mixer
+        # in the backward pass trades one extra forward for that memory:
+        # measured on a 768-atom water frame, depth 2, one force-training step
+        # peaks at 2.60 GiB above baseline without and 1.65 GiB with, and the
+        # parameter gradients agree to the last bit (the non-reentrant
+        # checkpoint supports the double backward).  Off by default; it changes
+        # cost, never the function.
+        self.mixer_checkpoint = bool(mixer_checkpoint)
         # Continuum quadrature factors, set by the owning model.  Both are one at
         # the resolution the model was constructed with.
         self.token_density_scale = 1.0
@@ -1142,10 +1185,23 @@ class EquivariantMambaACEBlock(nn.Module):
         controls = self.token_input(self._token_invariants(control_tokens))
         controls = controls + self.node_context(self._node_invariants(x))[:, None, :]
         controls = controls + self.kind_embedding(token_kind)[None, :, :]
-        controls = controls + self.coordinate_projection(token_coordinate[:, None])[
-            None, :, :
-        ]
+        controls = controls + self.coordinate_projection(
+            self._coordinate_features(token_coordinate)
+        )[None, :, :]
         return controls
+
+    def _coordinate_features(self, token_coordinate: torch.Tensor) -> torch.Tensor:
+        """``(L, 1)`` or ``(L, 1 + 2M)`` features of the reduced shell coordinate."""
+
+        column = token_coordinate[:, None]
+        if self.coordinate_features == "linear":
+            return column
+        orders = torch.arange(
+            1, self.coordinate_harmonics + 1,
+            device=token_coordinate.device, dtype=token_coordinate.dtype,
+        )
+        phase = math.pi * column * orders[None, :]
+        return torch.cat((column, torch.sin(phase), torch.cos(phase)), dim=-1)
 
     def screening_length(self, node_invariants: torch.Tensor) -> torch.Tensor:
         """Per-atom screening length in Angstrom, bounded below by a floor.
@@ -1178,13 +1234,24 @@ class EquivariantMambaACEBlock(nn.Module):
                 screening = (
                     self.shell_spacing_angstrom / lengths
                 )[:, :, None]
-            return self.mixer(
-                controls,
+            run = lambda u: self.mixer(
+                u,
                 require_higher_order=require_higher_order,
                 step_scale=self.step_scale,
                 screening=screening,
             )
-        return self.mixer(controls, require_higher_order=require_higher_order)
+        else:
+            run = lambda u: self.mixer(u, require_higher_order=require_higher_order)
+        # Recompute in reverse mode only where it buys something: a graph is
+        # being built, and neither scripting nor tracing is in progress.
+        if (
+            self.mixer_checkpoint
+            and torch.is_grad_enabled()
+            and controls.requires_grad
+            and not (torch.jit.is_scripting() or torch.jit.is_tracing())
+        ):
+            return _checkpoint(run, controls, use_reentrant=False)
+        return run(controls)
 
     def _isolated_mixer_states(
         self,

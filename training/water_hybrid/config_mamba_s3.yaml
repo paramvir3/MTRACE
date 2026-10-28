@@ -106,3 +106,4 @@ mixer_schedule:
 - mamba
 - mamba
 split_seed: 42
+mixer_checkpoint: true

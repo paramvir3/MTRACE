@@ -57,7 +57,17 @@ def save_checkpoint(
     rng_state: dict | None = None,
     run_signature: dict | None = None,
     ema_state: dict | None = None,
+    raw_state_dict: dict | None = None,
 ) -> None:
+    """Write a checkpoint.
+
+    ``model_state_dict`` is whatever the model currently holds -- under EMA the
+    trainer swaps the averaged weights in before saving a ``best`` checkpoint,
+    because those are the weights to deploy.  ``raw_state_dict`` then carries the
+    un-averaged iterate, which an exact resume needs; without it a resume from
+    ``best`` would silently restart the trajectory from the average.
+    """
+
     references = {int(k): float(v) for k, v in (atomic_energies or {}).items()}
     invalid_references = sorted(key for key in references if not 1 <= key <= 118)
     if invalid_references:
@@ -100,6 +110,7 @@ def save_checkpoint(
         "stale_epochs": int(stale_epochs),
         "rng_state": dict(rng_state or {}),
         "ema_state_dict": ema_state,
+        "raw_model_state_dict": raw_state_dict,
         "run_signature": dict(run_signature or {}),
         "atomic_energies": references,
         "atomic_numbers": species,

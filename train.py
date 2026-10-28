@@ -64,6 +64,7 @@ MODEL_KEYS = {
     "shell_pair_state_clip",
     "coupling_mode", "coupling_channels",
     "gate_norm", "gate_norm_scope",
+    "coordinate_features", "coordinate_harmonics", "mixer_checkpoint",
     "mixer_schedule",
     "num_experts", "expert_hidden", "expert_latent_dim",
     "router_tau", "router_switch", "router_threshold_init",
@@ -805,6 +806,9 @@ def main():
             # Architecture-v12 smoothness settings exist only on MambaACEV2.
             "mamba_decay_activation",
             "cutoff_switch",
+            "coordinate_features",
+            "coordinate_harmonics",
+            "mixer_checkpoint",
             "num_experts",
             "expert_hidden",
             "expert_latent_dim",
@@ -1218,6 +1222,19 @@ def main():
             )
         if ema is not None and saved_ema is not None:
             ema.load_state_dict(saved_ema)
+            if resume_checkpoint.get("checkpoint_role") == "best":
+                # restore_model loaded model_state_dict, which for a best
+                # checkpoint under EMA is the *average*.  Put the raw iterate
+                # back, or refuse: continuing from the average is a different
+                # trajectory, not a resume.
+                raw_state = resume_checkpoint.get("raw_model_state_dict")
+                if raw_state is None:
+                    raise ValueError(
+                        "This best checkpoint holds the EMA-averaged weights and no "
+                        "raw iterate, so it cannot be resumed exactly; resume from "
+                        "the last checkpoint instead"
+                    )
+                model.load_state_dict(raw_state, strict=True)
         print(f"resumed_from={resume_path} next_epoch={start_epoch}", flush=True)
     elif restart_checkpoint is not None:
         print(
@@ -1305,24 +1322,29 @@ def main():
             if ema is not None:
                 ema.update(model)
         training_metrics = finalize_metrics(training_totals)
-        if gate_probe is not None and (epoch == start_epoch or epoch % gate_every == 0):
-            report = model.gate_shell_dependence(**gate_probe)
-            summary = " ".join(
-                f"L{int(entry['layer'])}:res={entry['residual_fraction']:.4f}"
-                f",mix={entry['mixing_fraction']:.4f}"
-                f",|g|={entry['gate_abs_mean']:.3f}"
-                f",sd_shell={entry['gate_std_over_shells']:.4f}"
-                for entry in report
-            )
-            # res: share of the update a shell-constant gate cannot reproduce --
-            # shell-resolved gating, which the identity control also has.
-            # mix: share that exists only because shells exchange information,
-            # zero for the identity mixer.  ``mix`` is the one that tests whether
-            # the sequence model contributes; see gate_shell_dependence.
-            print(f"  gate_shell_dependence {summary}", flush=True)
         if ema is not None:
             ema.store(model)
         try:
+            # Measured on the weights that are validated and saved: under
+            # EMA those are the averaged ones, which ``store`` has just
+            # swapped in.  Measuring the raw iterate instead would report a
+            # model nobody evaluates.
+            if gate_probe is not None and (epoch == start_epoch or epoch % gate_every == 0):
+                report = model.gate_shell_dependence(**gate_probe)
+                summary = " ".join(
+                    f"L{int(entry['layer'])}:res={entry['residual_fraction']:.4f}"
+                    f",mix={entry['mixing_fraction']:.4f}"
+                    f",branch={entry['branch_fraction']:.4f}"
+                    f",|g|={entry['gate_abs_mean']:.3f}"
+                    f",sd_shell={entry['gate_std_over_shells']:.4f}"
+                    for entry in report
+                )
+                # res: share of the update a shell-constant gate cannot reproduce --
+                # shell-resolved gating, which the identity control also has.
+                # mix: share that exists only because shells exchange information,
+                # zero for the identity mixer.  ``mix`` is the one that tests whether
+                # the sequence model contributes; see gate_shell_dependence.
+                print(f"  gate_shell_dependence {summary}", flush=True)
             metrics = evaluate(
                 model,
                 validation_loader,
@@ -1350,7 +1372,14 @@ def main():
             data_generator, include_cuda=device.type == "cuda"
         )
         if improved:
+            raw_state = None
             if ema is not None:
+                # Keep the raw iterate next to the averaged weights, so that an
+                # exact resume from ``best`` is possible; see save_checkpoint.
+                raw_state = {
+                    key: value.detach().clone()
+                    for key, value in model.state_dict().items()
+                }
                 ema.store(model)
             save_checkpoint(
                 output,
@@ -1370,6 +1399,7 @@ def main():
                 rng_state=rng_state,
                 run_signature=run_signature,
                 ema_state=ema.state_dict() if ema is not None else None,
+                raw_state_dict=raw_state,
             )
             if ema is not None:
                 ema.restore(model)
